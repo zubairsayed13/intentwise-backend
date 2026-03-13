@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Query
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import psycopg2, psycopg2.extras, os, httpx, json
 from dotenv import load_dotenv
@@ -396,3 +397,29 @@ async def full_scan(account_id: str = Query("all")):
         return {"alerts":[],"analysis":{"summary":"No issues detected.","quality_score":98,"test_cases":[],"root_causes":[],"recommendations":["Continue monitoring"]}}
     analysis=await ai_analyze({"table":"orders + inventory + sales_and_traffic","schema":"mws","findings":alerts})
     return {"alerts":alerts,"analysis":analysis}
+
+
+class ChatRequest(BaseModel):
+    messages: list
+    system: str = ""
+    max_tokens: int = 1000
+
+@app.post("/api/ai/chat")
+async def ai_chat(req: ChatRequest):
+    api_key = os.environ.get("ANTHROPIC_API_KEY","")
+    if not api_key:
+        return {"error": "ANTHROPIC_API_KEY not set"}
+    async with httpx.AsyncClient(timeout=60) as client:
+        payload = {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": req.max_tokens,
+            "messages": req.messages,
+        }
+        if req.system:
+            payload["system"] = req.system
+        r = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json=payload
+        )
+        return r.json()
