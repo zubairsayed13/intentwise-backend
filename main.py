@@ -406,39 +406,45 @@ class ChatRequest(BaseModel):
 
 @app.post("/api/ai/chat")
 async def ai_chat(req: ChatRequest):
-    api_key = os.environ.get("ANTHROPIC_API_KEY","")
+    from fastapi.responses import JSONResponse
+    api_key = os.environ.get("OPENAI_API_KEY","")
     if not api_key:
-        return {"error": "ANTHROPIC_API_KEY not set"}
+        return JSONResponse(status_code=500, content={"error": "OPENAI_API_KEY not set in Railway"})
+    # Convert system prompt into OpenAI messages format
+    messages = []
+    if req.system:
+        messages.append({"role": "system", "content": req.system})
+    messages.extend(req.messages)
     async with httpx.AsyncClient(timeout=60) as client:
         payload = {
-            "model": "claude-sonnet-4-20250514",
+            "model": "gpt-4o",
             "max_tokens": req.max_tokens,
-            "messages": req.messages,
+            "messages": messages,
         }
-        if req.system:
-            payload["system"] = req.system
         r = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json=payload
         )
-        return r.json()
+        body = r.json()
+        if r.status_code != 200:
+            return JSONResponse(status_code=r.status_code, content=body)
+        # Normalise to Anthropic-style response so frontend doesn't need changes
+        text = body.get("choices", [{}])[0].get("message", {}).get("content", "")
+        return {"content": [{"type": "text", "text": text}]}
 
 @app.get("/api/ai/test")
 async def ai_test():
-    api_key = os.environ.get("ANTHROPIC_API_KEY","")
+    api_key = os.environ.get("OPENAI_API_KEY","")
     if not api_key:
-        return {"status": "error", "reason": "ANTHROPIC_API_KEY env var not set"}
+        return {"status": "error", "reason": "OPENAI_API_KEY env var not set"}
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                json={"model": "claude-sonnet-4-20250514", "max_tokens": 10, "messages": [{"role":"user","content":"hi"}]}
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"model":"gpt-4o","max_tokens":5,"messages":[{"role":"user","content":"hi"}]}
             )
-            if r.status_code == 200:
-                return {"status": "ok", "key_prefix": api_key[:8]+"..."}
-            else:
-                return {"status": "error", "http_status": r.status_code, "body": r.text[:300]}
+        return {"status": "ok" if r.status_code==200 else "error", "http_status": r.status_code}
     except Exception as e:
         return {"status": "error", "reason": str(e)}
