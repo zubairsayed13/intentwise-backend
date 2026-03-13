@@ -423,3 +423,22 @@ async def ai_chat(req: ChatRequest):
             json=payload
         )
         return r.json()
+
+@app.get("/api/ai/test")
+async def ai_test():
+    api_key = os.environ.get("ANTHROPIC_API_KEY","")
+    if not api_key:
+        return {"status": "error", "reason": "ANTHROPIC_API_KEY env var not set"}
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": "claude-sonnet-4-20250514", "max_tokens": 10, "messages": [{"role":"user","content":"hi"}]}
+            )
+            if r.status_code == 200:
+                return {"status": "ok", "key_prefix": api_key[:8]+"..."}
+            else:
+                return {"status": "error", "http_status": r.status_code, "body": r.text[:300]}
+    except Exception as e:
+        return {"status": "error", "reason": str(e)}
