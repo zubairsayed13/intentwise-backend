@@ -443,3 +443,126 @@ async def ai_test():
         return {"status": "ok" if r.status_code==200 else "error", "http_status": r.status_code}
     except Exception as e:
         return {"status": "error", "reason": str(e)}
+
+# ── Remediation ───────────────────────────────────────────────────────────────
+
+class RemediationFixRequest(BaseModel):
+    fix_type: str          # "delete_dupes" | "flag_nulls" | "delete_stale"
+    dry_run: bool = True   # True = count only, False = execute
+
+@app.get("/api/remediation/scan")
+def remediation_scan():
+    """Scan mws.orders for: NULL asin, duplicate amazon_order_id, stale download_date (>30 days)."""
+    try:
+        conn = get_connection()
+        null_asin = q(conn, "SELECT COUNT(*) AS cnt FROM mws.orders WHERE asin IS NULL")[0]["cnt"]
+        dupe_orders = q(conn, """
+            SELECT COUNT(*) AS cnt FROM (
+                SELECT amazon_order_id FROM mws.orders
+                GROUP BY amazon_order_id HAVING COUNT(*) > 1
+            ) d
+        """)[0]["cnt"]
+        stale_rows = q(conn, """
+            SELECT COUNT(*) AS cnt FROM mws.orders
+            WHERE download_date < CURRENT_DATE - INTERVAL '30 days'
+        """)[0]["cnt"]
+        total_rows = q(conn, "SELECT COUNT(*) AS cnt FROM mws.orders")[0]["cnt"]
+        conn.close()
+        return {
+            "table": "mws.orders",
+            "total_rows": int(total_rows),
+            "issues": [
+                {
+                    "id": "null_asin",
+                    "title": "NULL asin on orders",
+                    "severity": "high",
+                    "count": int(null_asin),
+                    "fix_sql": "UPDATE mws.orders SET asin = \'UNKNOWN\' WHERE asin IS NULL",
+                    "fix_type": "flag_nulls",
+                    "description": f"{null_asin} orders have no ASIN — cannot match to product catalog"
+                },
+                {
+                    "id": "dupe_orders",
+                    "title": "Duplicate amazon_order_id",
+                    "severity": "critical",
+                    "count": int(dupe_orders),
+                    "fix_sql": "DELETE FROM mws.orders WHERE id NOT IN (SELECT MIN(id) FROM mws.orders GROUP BY amazon_order_id)",
+                    "fix_type": "delete_dupes",
+                    "description": f"{dupe_orders} duplicate order IDs detected — downstream metrics will be double-counted"
+                },
+                {
+                    "id": "stale_rows",
+                    "title": "Stale rows (>30 days old)",
+                    "severity": "medium",
+                    "count": int(stale_rows),
+                    "fix_sql": "DELETE FROM mws.orders WHERE download_date < CURRENT_DATE - INTERVAL \'30 days\'",
+                    "fix_type": "delete_stale",
+                    "description": f"{stale_rows} rows with download_date older than 30 days"
+                }
+            ]
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/api/remediation/fix")
+def remediation_fix(req: RemediationFixRequest):
+    """Execute a fix on mws.orders. dry_run=True counts affected rows only."""
+    try:
+        conn = get_connection()
+        fix_map = {
+            "flag_nulls":    ("SELECT COUNT(*) AS cnt FROM mws.orders WHERE asin IS NULL",
+                              "UPDATE mws.orders SET asin = \'UNKNOWN\' WHERE asin IS NULL"),
+            "delete_dupes":  ("SELECT COUNT(*) AS cnt FROM mws.orders WHERE id NOT IN (SELECT MIN(id) FROM mws.orders GROUP BY amazon_order_id)",
+                              "DELETE FROM mws.orders WHERE id NOT IN (SELECT MIN(id) FROM mws.orders GROUP BY amazon_order_id)"),
+            "delete_stale":  ("SELECT COUNT(*) AS cnt FROM mws.orders WHERE download_date < CURRENT_DATE - INTERVAL \'30 days\'",
+                              "DELETE FROM mws.orders WHERE download_date < CURRENT_DATE - INTERVAL \'30 days\'"),
+        }
+        if req.fix_type not in fix_map:
+            return {"error": f"Unknown fix_type: {req.fix_type}"}
+
+        count_sql, fix_sql = fix_map[req.fix_type]
+        before = q(conn, "SELECT COUNT(*) AS cnt FROM mws.orders")[0]["cnt"]
+        affected = q(conn, count_sql)[0]["cnt"]
+
+        if req.dry_run:
+            conn.close()
+            return {"dry_run": True, "fix_type": req.fix_type, "rows_affected": int(affected), "before": int(before)}
+
+        cur = conn.cursor()
+        cur.execute(fix_sql)
+        conn.commit()
+        after = q(conn, "SELECT COUNT(*) AS cnt FROM mws.orders")[0]["cnt"]
+        conn.close()
+        return {
+            "dry_run": False,
+            "fix_type": req.fix_type,
+            "rows_affected": int(affected),
+            "before": int(before),
+            "after": int(after),
+            "success": True
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/api/remediation/notify")
+async def remediation_notify(payload: dict):
+    """Send a Slack notification for a remediation result."""
+    slack_url = os.getenv("SLACK_WEBHOOK_URL", "")
+    if not slack_url:
+        return {"error": "SLACK_WEBHOOK_URL not set in environment"}
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(slack_url, json={
+                "text": payload.get("message", "Remediation complete"),
+                "blocks": [
+                    {"type": "section", "text": {"type": "mrkdwn",
+                        "text": f"*🔧 Remediation Complete — mws.orders*\n{payload.get('message','')}"}},
+                    {"type": "context", "elements": [
+                        {"type": "mrkdwn", "text": f"Fix: `{payload.get('fix_type','')}` · Rows affected: *{payload.get('rows_affected',0)}* · Before: {payload.get('before',0)} → After: {payload.get('after',0)}"}
+                    ]}
+                ]
+            }, timeout=10)
+        return {"sent": resp.status_code == 200, "status": resp.status_code}
+    except Exception as e:
+        return {"error": str(e)}
+
