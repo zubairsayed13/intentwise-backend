@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Query
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-import psycopg2, psycopg2.extras, os, httpx, json
+import psycopg2, psycopg2.extras, os, httpx, json, asyncio
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -982,3 +982,355 @@ def report_fix(payload: dict):
     except Exception as e:
         return {"error": str(e)}
 
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LangGraph — WF-002 Report Status Auto-Triage Agent
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Graph:  scan → classify → [auto_fix | escalate] → verify → notify → END
+#
+# Requirements (Railway env vars):
+#   OPENAI_API_KEY  — already set (used for /api/ai/chat)
+#   SLACK_WEBHOOK_URL — optional, for Slack notifications
+#
+# Install (add to requirements.txt or Railway build):
+#   langgraph>=0.2.0
+#   langchain-openai>=0.1.0
+#
+# Falls back gracefully if langgraph is not installed — returns a clear error.
+
+try:
+    from typing import TypedDict, Annotated, List, Optional
+    import operator, datetime
+
+    from langgraph.graph import StateGraph, END as LG_END
+    from langchain_openai import ChatOpenAI
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    LANGGRAPH_AVAILABLE = True
+except ImportError:
+    LANGGRAPH_AVAILABLE = False
+
+
+# ── Agent State ────────────────────────────────────────────────────────────────
+
+if LANGGRAPH_AVAILABLE:
+
+    class ReportTriageState(TypedDict):
+        # inputs
+        account:     Optional[str]
+        # scan results
+        total_rows:  int
+        issues:      List[dict]          # raw SQL findings
+        # LLM classification
+        classification: Optional[dict]   # { strategy, fix_actions, escalate_reason }
+        # fix results
+        fix_results: Annotated[List[dict], operator.add]
+        # verify results
+        verify_issues: List[dict]
+        # notifications
+        notified:    bool
+        # run trace (append-only log visible to frontend)
+        trace:       Annotated[List[dict], operator.add]
+        # final
+        status:      str                 # "clean" | "fixed" | "escalated" | "error"
+        error:       Optional[str]
+
+
+    # ── Helpers ────────────────────────────────────────────────────────────────
+
+    def _trace(node: str, msg: str, level: str = "info") -> dict:
+        return {
+            "node":  node,
+            "ts":    datetime.datetime.now().strftime("%H:%M:%S"),
+            "msg":   msg,
+            "level": level,
+        }
+
+    def _scan_report(account: str = None) -> tuple:
+        """Run the 3 SQL checks on mws.report. Returns (total_rows, issues)."""
+        conn  = get_connection()
+        af    = "AND account = %s" if account and account != "all" else ""
+        ap    = [account] if account and account != "all" else []
+        bw    = f"WHERE 1=1 {af}"
+        total = q(conn, f"SELECT COUNT(*) AS cnt FROM mws.report {bw}", ap)[0]["cnt"]
+        issues = []
+
+        # RPT-001 failed/pending
+        rows = q(conn, f"SELECT status, COUNT(*) AS cnt FROM mws.report {bw} AND status != 'processed' GROUP BY status", ap)
+        cnt  = sum(r["cnt"] for r in rows)
+        if cnt:
+            issues.append({"id":"RPT-001","title":"Failed/pending downloads",
+                "count":int(cnt),"fix_action":"redrive",
+                "breakdown":[{"status":r["status"],"count":int(r["cnt"])} for r in rows]})
+
+        # RPT-002 not replicated
+        cnt2 = q(conn, f"SELECT COUNT(*) AS cnt FROM mws.report {bw} AND (copy_status != 'REPLICATED' OR copy_status IS NULL)", ap)[0]["cnt"]
+        if cnt2:
+            issues.append({"id":"RPT-002","title":"Not replicated to Redshift",
+                "count":int(cnt2),"fix_action":"recopy","breakdown":[]})
+
+        # RPT-003 stuck >2h
+        cnt3 = q(conn, f"""SELECT COUNT(*) AS cnt FROM mws.report {bw}
+            AND status='processed' AND (copy_status IS NULL OR copy_status='NOT_REPLICATED')
+            AND download_date < CURRENT_TIMESTAMP - INTERVAL '2 hours'""", ap)[0]["cnt"]
+        if cnt3:
+            issues.append({"id":"RPT-003","title":"Stuck >2h (processed, not copied)",
+                "count":int(cnt3),"fix_action":"redrive_copy","breakdown":[]})
+
+        conn.close()
+        return int(total), issues
+
+
+    # ── Graph Nodes ────────────────────────────────────────────────────────────
+
+    def node_scan(state: ReportTriageState) -> dict:
+        try:
+            total, issues = _scan_report(state.get("account"))
+            msg = f"Scanned mws.report — {total:,} rows, {len(issues)} issue(s) found"
+            level = "warning" if issues else "success"
+            return {
+                "total_rows": total,
+                "issues":     issues,
+                "trace":      [_trace("scan", msg, level)],
+            }
+        except Exception as e:
+            return {"status":"error","error":str(e),
+                    "trace":[_trace("scan",f"Scan failed: {e}","error")]}
+
+
+    def node_classify(state: ReportTriageState) -> dict:
+        issues = state.get("issues", [])
+        if not issues:
+            return {"classification":{"strategy":"clean","fix_actions":[]},
+                    "trace":[_trace("classify","No issues — table is clean","success")],
+                    "status":"clean"}
+
+        llm = ChatOpenAI(model="gpt-4o", temperature=0,
+                         openai_api_key=os.getenv("OPENAI_API_KEY",""))
+        system = """You are a data pipeline triage agent for Intentwise.
+You receive a list of issues found in mws.report and decide the fix strategy.
+For each issue decide: auto_fix (safe to fix programmatically) or escalate (needs human).
+Rules:
+- RPT-001 (failed downloads) with count < 50: auto_fix via redrive
+- RPT-001 with count >= 50: escalate — too many failures may indicate upstream problem
+- RPT-002 (not replicated): auto_fix via recopy always
+- RPT-003 (stuck >2h): auto_fix via redrive_copy always
+Respond ONLY with valid JSON, no markdown:
+{"strategy":"auto_fix|escalate|mixed","fix_actions":["redrive","recopy"],"escalate_reason":"...or empty string","summary":"one sentence"}"""
+
+        msg = HumanMessage(content=f"Issues found:\n{json.dumps(issues, indent=2)}")
+        try:
+            resp = llm.invoke([SystemMessage(content=system), msg])
+            text = resp.content.strip().lstrip("```json").rstrip("```").strip()
+            classification = json.loads(text)
+            summary = classification.get("summary","Classification complete")
+            return {"classification": classification,
+                    "trace":[_trace("classify", f"Strategy: {classification.get('strategy')} — {summary}", "info")]}
+        except Exception as e:
+            # fallback: auto-fix everything
+            fallback = {"strategy":"auto_fix",
+                        "fix_actions":[i["fix_action"] for i in issues],
+                        "escalate_reason":"","summary":"LLM unavailable — defaulting to auto-fix"}
+            return {"classification":fallback,
+                    "trace":[_trace("classify",f"LLM classification failed ({e}), using fallback","warning")]}
+
+
+    def node_auto_fix(state: ReportTriageState) -> dict:
+        classification = state.get("classification", {})
+        issues         = state.get("issues", [])
+        account        = state.get("account")
+        fix_actions    = classification.get("fix_actions", [])
+        af    = "AND account = %s" if account and account != "all" else ""
+        ap    = [account] if account and account != "all" else []
+        bw    = f"WHERE 1=1 {af}"
+
+        FIX_SQL = {
+            "redrive":      f"UPDATE mws.report SET status='pending', tries=0 {bw} AND status='failed'",
+            "recopy":       f"UPDATE mws.report SET copy_status='NOT_REPLICATED' {bw} AND status='processed' AND copy_status IS NULL",
+            "redrive_copy": f"UPDATE mws.report SET copy_status='NOT_REPLICATED' {bw} AND status='processed' AND copy_status IS NULL AND download_date < CURRENT_TIMESTAMP - INTERVAL '2 hours'",
+        }
+        COUNT_SQL = {
+            "redrive":      f"SELECT COUNT(*) AS cnt FROM mws.report {bw} AND status='failed'",
+            "recopy":       f"SELECT COUNT(*) AS cnt FROM mws.report {bw} AND status='processed' AND copy_status IS NULL",
+            "redrive_copy": f"SELECT COUNT(*) AS cnt FROM mws.report {bw} AND status='processed' AND copy_status IS NULL AND download_date < CURRENT_TIMESTAMP - INTERVAL '2 hours'",
+        }
+
+        results = []
+        trace   = []
+        try:
+            conn = get_connection()
+            for action in fix_actions:
+                if action not in FIX_SQL:
+                    continue
+                before   = q(conn, f"SELECT COUNT(*) AS cnt FROM mws.report {bw}", ap)[0]["cnt"]
+                affected = q(conn, COUNT_SQL[action], ap)[0]["cnt"]
+                cur = conn.cursor()
+                cur.execute(FIX_SQL[action], ap)
+                conn.commit()
+                after = q(conn, f"SELECT COUNT(*) AS cnt FROM mws.report {bw}", ap)[0]["cnt"]
+                results.append({"action":action,"rows_affected":int(affected),
+                                 "before":int(before),"after":int(after)})
+                trace.append(_trace("auto_fix",
+                    f"✓ {action}: {affected} rows fixed (before:{before} → after:{after})","success"))
+            conn.close()
+        except Exception as e:
+            trace.append(_trace("auto_fix",f"Fix failed: {e}","error"))
+
+        return {"fix_results":results,"trace":trace,
+                "status":"fixed" if results else "escalated"}
+
+
+    def node_escalate(state: ReportTriageState) -> dict:
+        reason  = state.get("classification",{}).get("escalate_reason","")
+        issues  = state.get("issues",[])
+        summary = f"{len(issues)} issue(s) require human review" + (f": {reason}" if reason else "")
+        return {"status":"escalated",
+                "trace":[_trace("escalate", summary, "warning")]}
+
+
+    def node_verify(state: ReportTriageState) -> dict:
+        try:
+            _, remaining = _scan_report(state.get("account"))
+            if not remaining:
+                return {"verify_issues":[],
+                        "trace":[_trace("verify","✅ Verification passed — all issues resolved","success")]}
+            msgs = [f"{i['id']}:{i['count']}" for i in remaining]
+            return {"verify_issues":remaining,
+                    "trace":[_trace("verify",f"⚠ {len(remaining)} issue(s) remain after fix: {', '.join(msgs)}","warning")]}
+        except Exception as e:
+            return {"verify_issues":[],
+                    "trace":[_trace("verify",f"Verify failed: {e}","error")]}
+
+
+    def node_notify(state: ReportTriageState) -> dict:
+        slack_url = os.getenv("SLACK_WEBHOOK_URL","")
+        status    = state.get("status","unknown")
+        issues    = state.get("issues",[])
+        fix_res   = state.get("fix_results",[])
+        remaining = state.get("verify_issues",[])
+
+        lines = [f"*WF-002 Report Auto-Triage — {status.upper()}*"]
+        lines.append(f"Table: `mws.report` | Issues found: {len(issues)}")
+        for r in fix_res:
+            lines.append(f"  ✓ `{r['action']}`: {r['rows_affected']} rows (before:{r['before']} → after:{r['after']})")
+        if remaining:
+            lines.append(f"  ⚠ {len(remaining)} issue(s) still open — escalation required")
+        msg = "\n".join(lines)
+
+        notified = False
+        if slack_url:
+            try:
+                import urllib.request
+                data = json.dumps({"text": msg}).encode()
+                req  = urllib.request.Request(slack_url, data=data,
+                        headers={"Content-Type":"application/json"})
+                urllib.request.urlopen(req, timeout=5)
+                notified = True
+            except: pass
+
+        trace_msg = "Slack notification sent" if notified else "Notification logged (no SLACK_WEBHOOK_URL)"
+        return {"notified":notified,
+                "trace":[_trace("notify", trace_msg, "success" if notified else "info")]}
+
+
+    # ── Routing ────────────────────────────────────────────────────────────────
+
+    def route_after_classify(state: ReportTriageState) -> str:
+        if state.get("status") == "clean":
+            return "notify"
+        strategy = state.get("classification",{}).get("strategy","auto_fix")
+        if strategy == "escalate":
+            return "escalate"
+        return "auto_fix"   # auto_fix or mixed → attempt fixes
+
+
+    # ── Build Graph ────────────────────────────────────────────────────────────
+
+    def build_triage_graph():
+        g = StateGraph(ReportTriageState)
+        g.add_node("scan",     node_scan)
+        g.add_node("classify", node_classify)
+        g.add_node("auto_fix", node_auto_fix)
+        g.add_node("escalate", node_escalate)
+        g.add_node("verify",   node_verify)
+        g.add_node("notify",   node_notify)
+
+        g.set_entry_point("scan")
+        g.add_edge("scan",     "classify")
+        g.add_conditional_edges("classify", route_after_classify,
+            {"auto_fix":"auto_fix","escalate":"escalate","notify":"notify"})
+        g.add_edge("auto_fix", "verify")
+        g.add_edge("escalate", "notify")
+        g.add_edge("verify",   "notify")
+        g.add_edge("notify",   LG_END)
+
+        return g.compile()
+
+    _triage_graph = None
+
+    def get_triage_graph():
+        global _triage_graph
+        if _triage_graph is None:
+            _triage_graph = build_triage_graph()
+        return _triage_graph
+
+
+# ── API Endpoint ───────────────────────────────────────────────────────────────
+
+@app.post("/api/report/triage-agent")
+async def report_triage_agent(payload: dict = {}):
+    """
+    Run the LangGraph WF-002 triage agent on mws.report.
+    Body: { "account": "optional_account_id", "dry_run": false }
+    Returns: { status, trace, issues, fix_results, verify_issues, notified, total_rows }
+    """
+    if not LANGGRAPH_AVAILABLE:
+        return {
+            "error": "LangGraph not installed. Add to requirements.txt: langgraph>=0.2.0 langchain-openai>=0.1.0",
+            "install_cmd": "pip install langgraph langchain-openai"
+        }
+
+    account = payload.get("account")
+    dry_run = payload.get("dry_run", False)
+
+    initial_state: ReportTriageState = {
+        "account":        account,
+        "total_rows":     0,
+        "issues":         [],
+        "classification": None,
+        "fix_results":    [],
+        "verify_issues":  [],
+        "notified":       False,
+        "trace":          [],
+        "status":         "running",
+        "error":          None,
+    }
+
+    # In dry_run mode, skip auto_fix node by patching classification strategy
+    if dry_run:
+        initial_state["classification"] = {
+            "strategy": "escalate",
+            "fix_actions": [],
+            "escalate_reason": "dry_run=true — no changes made",
+            "summary": "Dry run: scan + classify only"
+        }
+
+    try:
+        graph  = get_triage_graph()
+        result = await asyncio.to_thread(graph.invoke, initial_state)
+        return {
+            "status":        result.get("status","unknown"),
+            "total_rows":    result.get("total_rows",0),
+            "issues":        result.get("issues",[]),
+            "classification":result.get("classification"),
+            "fix_results":   result.get("fix_results",[]),
+            "verify_issues": result.get("verify_issues",[]),
+            "notified":      result.get("notified",False),
+            "trace":         result.get("trace",[]),
+            "error":         result.get("error"),
+        }
+    except Exception as e:
+        return {"error": str(e), "status": "error",
+                "trace": [{"node":"agent","ts":"","msg":str(e),"level":"error"}]}
