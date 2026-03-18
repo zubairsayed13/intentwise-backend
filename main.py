@@ -69,12 +69,7 @@ def get_tables():
             ORDER BY t.table_schema, t.table_name
         """)
         conn.close()
-        schemas = {}
-        for r in rows:
-            s = r["table_schema"]
-            if s not in schemas: schemas[s] = []
-            schemas[s].append({"name": r["table_name"], "column_count": int(r["column_count"])})
-        return [{"schema": s, "tables": t} for s, t in schemas.items()]
+        return [{"table_schema": r["table_schema"], "table_name": r["table_name"], "column_count": int(r["column_count"])} for r in rows]
     except Exception as e:
         return {"error": str(e)}
 
