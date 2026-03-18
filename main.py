@@ -985,24 +985,26 @@ def report_fix(payload: dict):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# LangGraph — WF-002 Report Status Auto-Triage Agent
+# WiziAgent — Autonomous Data Quality Agent (powered by LangGraph)
 # ═══════════════════════════════════════════════════════════════════════════════
 #
-# Graph:  scan → classify → [auto_fix | escalate] → verify → notify → END
+# Graph:
+#   scan → classify → [high_risk? → request_approval → awaiting] OR auto_fix
+#        → verify_loop (up to 3 attempts, re-fixes on each attempt)
+#        → notify → END
 #
-# Requirements (Railway env vars):
-#   OPENAI_API_KEY  — already set (used for /api/ai/chat)
-#   SLACK_WEBHOOK_URL — optional, for Slack notifications
+# Approval flow:
+#   High-risk fixes (count >= threshold) post a Slack message and pause.
+#   Call POST /api/wizi-agent/approve { token, decision:"approve"|"reject" }
+#   to resume. Frontend polls /api/wizi-agent/status/{token}.
 #
-# Install (add to requirements.txt or Railway build):
-#   langgraph>=0.2.0
-#   langchain-openai>=0.1.0
-#
-# Falls back gracefully if langgraph is not installed — returns a clear error.
+# Railway env vars required:
+#   OPENAI_API_KEY     — already set
+#   SLACK_WEBHOOK_URL  — optional, for approval requests + notifications
 
 try:
     from typing import TypedDict, Annotated, List, Optional
-    import operator, datetime
+    import operator, datetime, uuid, threading
 
     from langgraph.graph import StateGraph, END as LG_END
     from langchain_openai import ChatOpenAI
@@ -1012,139 +1014,214 @@ try:
 except ImportError:
     LANGGRAPH_AVAILABLE = False
 
-
-# ── Agent State ────────────────────────────────────────────────────────────────
+# ── In-memory approval store (survives for duration of Railway process) ────────
+# { token: { "decision": None|"approve"|"reject", "event": threading.Event } }
+_approval_store: dict = {}
 
 if LANGGRAPH_AVAILABLE:
 
+    # ── State ──────────────────────────────────────────────────────────────────
     class ReportTriageState(TypedDict):
-        # inputs
-        account:     Optional[str]
-        # scan results
-        total_rows:  int
-        issues:      List[dict]          # raw SQL findings
-        # LLM classification
-        classification: Optional[dict]   # { strategy, fix_actions, escalate_reason }
-        # fix results
-        fix_results: Annotated[List[dict], operator.add]
-        # verify results
-        verify_issues: List[dict]
-        # notifications
-        notified:    bool
-        # run trace (append-only log visible to frontend)
-        trace:       Annotated[List[dict], operator.add]
+        account:          Optional[str]
+        # scan
+        total_rows:       int
+        issues:           List[dict]
+        # classify
+        classification:   Optional[dict]
+        # approval gate
+        needs_approval:   bool
+        approval_token:   Optional[str]
+        approval_status:  str           # "pending"|"approved"|"rejected"|"skipped"
+        threshold:        int
+        # fix
+        fix_results:      Annotated[List[dict], operator.add]
+        # verify loop
+        verify_attempts:  int
+        verify_issues:    List[dict]
+        # notify
+        notified:         bool
+        # trace
+        trace:            Annotated[List[dict], operator.add]
         # final
-        status:      str                 # "clean" | "fixed" | "escalated" | "error"
-        error:       Optional[str]
+        status:           str
+        error:            Optional[str]
 
+    def _t(node, msg, level="info"):
+        return {"node": node,
+                "ts":   datetime.datetime.now().strftime("%H:%M:%S"),
+                "msg":  msg, "level": level}
 
-    # ── Helpers ────────────────────────────────────────────────────────────────
+    def _scan_report(account=None):
+        conn = get_connection()
+        af   = "AND account = %s" if account and account != "all" else ""
+        ap   = [account] if account and account != "all" else []
+        bw   = f"WHERE 1=1 {af}"
 
-    def _trace(node: str, msg: str, level: str = "info") -> dict:
-        return {
-            "node":  node,
-            "ts":    datetime.datetime.now().strftime("%H:%M:%S"),
-            "msg":   msg,
-            "level": level,
-        }
-
-    def _scan_report(account: str = None) -> tuple:
-        """Run the 3 SQL checks on mws.report. Returns (total_rows, issues)."""
-        conn  = get_connection()
-        af    = "AND account = %s" if account and account != "all" else ""
-        ap    = [account] if account and account != "all" else []
-        bw    = f"WHERE 1=1 {af}"
         total = q(conn, f"SELECT COUNT(*) AS cnt FROM mws.report {bw}", ap)[0]["cnt"]
         issues = []
 
         # RPT-001 failed/pending
-        rows = q(conn, f"SELECT status, COUNT(*) AS cnt FROM mws.report {bw} AND status != 'processed' GROUP BY status", ap)
-        cnt  = sum(r["cnt"] for r in rows)
+        rows = q(conn, f"""SELECT status, COUNT(*) AS cnt FROM mws.report {bw}
+            AND status != 'processed' GROUP BY status""", ap)
+        cnt = sum(r["cnt"] for r in rows)
         if cnt:
             issues.append({"id":"RPT-001","title":"Failed/pending downloads",
-                "count":int(cnt),"fix_action":"redrive",
+                "count":int(cnt),"fix_action":"redrive","severity":"critical" if cnt>20 else "high",
                 "breakdown":[{"status":r["status"],"count":int(r["cnt"])} for r in rows]})
 
         # RPT-002 not replicated
-        cnt2 = q(conn, f"SELECT COUNT(*) AS cnt FROM mws.report {bw} AND (copy_status != 'REPLICATED' OR copy_status IS NULL)", ap)[0]["cnt"]
+        cnt2 = q(conn, f"""SELECT COUNT(*) AS cnt FROM mws.report {bw}
+            AND (copy_status != 'REPLICATED' OR copy_status IS NULL)""", ap)[0]["cnt"]
         if cnt2:
+            breakdown = q(conn, f"""SELECT COALESCE(copy_status,'NULL') AS cs, COUNT(*) AS cnt
+                FROM mws.report {bw} AND (copy_status != 'REPLICATED' OR copy_status IS NULL)
+                GROUP BY 1""", ap)
             issues.append({"id":"RPT-002","title":"Not replicated to Redshift",
-                "count":int(cnt2),"fix_action":"recopy","breakdown":[]})
+                "count":int(cnt2),"fix_action":"recopy","severity":"high",
+                "breakdown":[{"status":r["cs"],"count":int(r["cnt"])} for r in breakdown]})
 
         # RPT-003 stuck >2h
         cnt3 = q(conn, f"""SELECT COUNT(*) AS cnt FROM mws.report {bw}
-            AND status='processed' AND (copy_status IS NULL OR copy_status='NOT_REPLICATED')
+            AND status='processed'
+            AND (copy_status IS NULL OR copy_status='NOT_REPLICATED')
             AND download_date < CURRENT_TIMESTAMP - INTERVAL '2 hours'""", ap)[0]["cnt"]
         if cnt3:
             issues.append({"id":"RPT-003","title":"Stuck >2h (processed, not copied)",
-                "count":int(cnt3),"fix_action":"redrive_copy","breakdown":[]})
+                "count":int(cnt3),"fix_action":"redrive_copy","severity":"high","breakdown":[]})
 
         conn.close()
         return int(total), issues
 
-
-    # ── Graph Nodes ────────────────────────────────────────────────────────────
+    # ── Nodes ──────────────────────────────────────────────────────────────────
 
     def node_scan(state: ReportTriageState) -> dict:
         try:
             total, issues = _scan_report(state.get("account"))
-            msg = f"Scanned mws.report — {total:,} rows, {len(issues)} issue(s) found"
-            level = "warning" if issues else "success"
-            return {
-                "total_rows": total,
-                "issues":     issues,
-                "trace":      [_trace("scan", msg, level)],
-            }
+            msg = f"Scanned mws.report — {total:,} rows, {len(issues)} issue(s)"
+            return {"total_rows": total, "issues": issues,
+                    "trace": [_t("scan", msg, "warning" if issues else "success")]}
         except Exception as e:
             return {"status":"error","error":str(e),
-                    "trace":[_trace("scan",f"Scan failed: {e}","error")]}
-
+                    "trace":[_t("scan",f"Scan failed: {e}","error")]}
 
     def node_classify(state: ReportTriageState) -> dict:
-        issues = state.get("issues", [])
+        issues    = state.get("issues",[])
+        threshold = state.get("threshold", 50)
+
         if not issues:
-            return {"classification":{"strategy":"clean","fix_actions":[]},
-                    "trace":[_trace("classify","No issues — table is clean","success")],
-                    "status":"clean"}
+            return {"classification":{"strategy":"clean","fix_actions":[],
+                "needs_approval":False},"status":"clean",
+                "trace":[_t("classify","No issues — mws.report is clean","success")]}
 
         llm = ChatOpenAI(model="gpt-4o", temperature=0,
                          openai_api_key=os.getenv("OPENAI_API_KEY",""))
-        system = """You are a data pipeline triage agent for Intentwise.
-You receive a list of issues found in mws.report and decide the fix strategy.
-For each issue decide: auto_fix (safe to fix programmatically) or escalate (needs human).
-Rules:
-- RPT-001 (failed downloads) with count < 50: auto_fix via redrive
-- RPT-001 with count >= 50: escalate — too many failures may indicate upstream problem
-- RPT-002 (not replicated): auto_fix via recopy always
-- RPT-003 (stuck >2h): auto_fix via redrive_copy always
-Respond ONLY with valid JSON, no markdown:
-{"strategy":"auto_fix|escalate|mixed","fix_actions":["redrive","recopy"],"escalate_reason":"...or empty string","summary":"one sentence"}"""
-
-        msg = HumanMessage(content=f"Issues found:\n{json.dumps(issues, indent=2)}")
+        system = f"""You are WiziAgent, an autonomous data quality agent for Intentwise.
+Analyse issues in mws.report and decide the fix strategy.
+Approval threshold: {threshold} rows. Fixes affecting >= {threshold} rows are HIGH RISK and need human approval.
+For each issue:
+- RPT-001 (failed downloads, count < {threshold}): auto_fix via redrive
+- RPT-001 (count >= {threshold}): needs_approval=true (too many failures — upstream issue likely)
+- RPT-002 (not replicated): auto_fix via recopy (always safe)
+- RPT-003 (stuck >2h): auto_fix via redrive_copy (always safe)
+Respond ONLY with JSON (no markdown):
+{{"strategy":"auto_fix|needs_approval|escalate","fix_actions":["redrive","recopy"],"needs_approval":true|false,"escalate_reason":"","summary":"one sentence","risk_reason":"why approval needed or empty"}}"""
         try:
-            resp = llm.invoke([SystemMessage(content=system), msg])
+            resp = llm.invoke([SystemMessage(content=system),
+                               HumanMessage(content=json.dumps(issues, indent=2))])
             text = resp.content.strip().lstrip("```json").rstrip("```").strip()
-            classification = json.loads(text)
-            summary = classification.get("summary","Classification complete")
-            return {"classification": classification,
-                    "trace":[_trace("classify", f"Strategy: {classification.get('strategy')} — {summary}", "info")]}
+            cl   = json.loads(text)
+            needs = cl.get("needs_approval", False)
+            return {"classification": cl, "needs_approval": bool(needs),
+                    "trace":[_t("classify",
+                        f"Strategy: {cl.get('strategy')} — {cl.get('summary','')}",
+                        "warning" if needs else "info")]}
         except Exception as e:
-            # fallback: auto-fix everything
-            fallback = {"strategy":"auto_fix",
-                        "fix_actions":[i["fix_action"] for i in issues],
-                        "escalate_reason":"","summary":"LLM unavailable — defaulting to auto-fix"}
-            return {"classification":fallback,
-                    "trace":[_trace("classify",f"LLM classification failed ({e}), using fallback","warning")]}
+            # safe fallback
+            total_affected = sum(i["count"] for i in issues)
+            needs = total_affected >= threshold
+            cl = {"strategy":"needs_approval" if needs else "auto_fix",
+                  "fix_actions":[i["fix_action"] for i in issues],
+                  "needs_approval": needs,
+                  "escalate_reason":"LLM unavailable",
+                  "summary":"Fallback: auto-classify by threshold",
+                  "risk_reason":f"Total affected rows {total_affected} >= threshold {threshold}" if needs else ""}
+            return {"classification":cl,"needs_approval":needs,
+                    "trace":[_t("classify",f"LLM failed ({e}), fallback used","warning")]}
 
+    def node_request_approval(state: ReportTriageState) -> dict:
+        """Post to Slack and store approval token. Returns immediately — does NOT block."""
+        token     = str(uuid.uuid4())[:8]
+        issues    = state.get("issues",[])
+        cl        = state.get("classification",{})
+        slack_url = os.getenv("SLACK_WEBHOOK_URL","")
+        base_url  = os.getenv("BACKEND_URL",
+                    "https://intentwise-backend-production.up.railway.app")
+
+        # Register token
+        evt = threading.Event()
+        _approval_store[token] = {"decision": None, "event": evt}
+
+        approve_url = f"{base_url}/api/wizi-agent/approve"
+        lines = [
+            f"*⚠️ WiziAgent — Approval Required*",
+            f"Table: `mws.report` | Risk: {cl.get('risk_reason','')}",
+            "",
+        ]
+        for i in issues:
+            lines.append(f"  • {i['title']}: *{i['count']:,} rows* affected ({i['fix_action']})")
+        lines += [
+            "",
+            f"To approve:  `POST {approve_url}` `{{\"token\":\"{token}\",\"decision\":\"approve\"}}`",
+            f"To reject:   `POST {approve_url}` `{{\"token\":\"{token}\",\"decision\":\"reject\"}}`",
+            f"Or use the UI: Automation → Report Triage → Pending Approvals",
+        ]
+        msg = "\n".join(lines)
+
+        if slack_url:
+            try:
+                import urllib.request as ur
+                data = json.dumps({"text": msg}).encode()
+                req  = ur.Request(slack_url, data=data,
+                        headers={"Content-Type":"application/json"})
+                ur.urlopen(req, timeout=5)
+            except: pass
+
+        return {
+            "approval_token":  token,
+            "approval_status": "pending",
+            "status":          "awaiting_approval",
+            "trace": [_t("request_approval",
+                f"Approval requested (token: {token}) — awaiting human decision",
+                "warning")],
+        }
+
+    def node_await_approval(state: ReportTriageState) -> dict:
+        """Block (up to 10 min) waiting for the approval decision."""
+        token = state.get("approval_token","")
+        entry = _approval_store.get(token)
+        if not entry:
+            return {"approval_status":"rejected",
+                    "trace":[_t("await_approval","Token not found — rejecting","error")]}
+
+        # Wait up to 10 minutes
+        granted = entry["event"].wait(timeout=600)
+        decision = entry.get("decision","rejected")
+
+        if not granted or decision == "rejected":
+            return {"approval_status":"rejected","status":"escalated",
+                    "trace":[_t("await_approval",
+                        "Approval rejected or timed out — no changes made","warning")]}
+
+        return {"approval_status":"approved",
+                "trace":[_t("await_approval","✅ Approved — proceeding with fix","success")]}
 
     def node_auto_fix(state: ReportTriageState) -> dict:
-        classification = state.get("classification", {})
-        issues         = state.get("issues", [])
-        account        = state.get("account")
-        fix_actions    = classification.get("fix_actions", [])
-        af    = "AND account = %s" if account and account != "all" else ""
-        ap    = [account] if account and account != "all" else []
-        bw    = f"WHERE 1=1 {af}"
+        cl       = state.get("classification",{})
+        issues   = state.get("issues",[])
+        account  = state.get("account")
+        af       = "AND account = %s" if account and account != "all" else ""
+        ap       = [account] if account and account != "all" else []
+        bw       = f"WHERE 1=1 {af}"
 
         FIX_SQL = {
             "redrive":      f"UPDATE mws.report SET status='pending', tries=0 {bw} AND status='failed'",
@@ -1157,13 +1234,12 @@ Respond ONLY with valid JSON, no markdown:
             "redrive_copy": f"SELECT COUNT(*) AS cnt FROM mws.report {bw} AND status='processed' AND copy_status IS NULL AND download_date < CURRENT_TIMESTAMP - INTERVAL '2 hours'",
         }
 
-        results = []
-        trace   = []
+        fix_actions = cl.get("fix_actions",[])
+        results = []; trace = []
         try:
             conn = get_connection()
             for action in fix_actions:
-                if action not in FIX_SQL:
-                    continue
+                if action not in FIX_SQL: continue
                 before   = q(conn, f"SELECT COUNT(*) AS cnt FROM mws.report {bw}", ap)[0]["cnt"]
                 affected = q(conn, COUNT_SQL[action], ap)[0]["cnt"]
                 cur = conn.cursor()
@@ -1172,104 +1248,169 @@ Respond ONLY with valid JSON, no markdown:
                 after = q(conn, f"SELECT COUNT(*) AS cnt FROM mws.report {bw}", ap)[0]["cnt"]
                 results.append({"action":action,"rows_affected":int(affected),
                                  "before":int(before),"after":int(after)})
-                trace.append(_trace("auto_fix",
+                trace.append(_t("auto_fix",
                     f"✓ {action}: {affected} rows fixed (before:{before} → after:{after})","success"))
             conn.close()
         except Exception as e:
-            trace.append(_trace("auto_fix",f"Fix failed: {e}","error"))
+            trace.append(_t("auto_fix", f"Fix failed: {e}", "error"))
 
         return {"fix_results":results,"trace":trace,
-                "status":"fixed" if results else "escalated"}
-
-
-    def node_escalate(state: ReportTriageState) -> dict:
-        reason  = state.get("classification",{}).get("escalate_reason","")
-        issues  = state.get("issues",[])
-        summary = f"{len(issues)} issue(s) require human review" + (f": {reason}" if reason else "")
-        return {"status":"escalated",
-                "trace":[_trace("escalate", summary, "warning")]}
-
+                "status":"fixed" if results else "escalated",
+                "verify_attempts": 0}
 
     def node_verify(state: ReportTriageState) -> dict:
-        try:
-            _, remaining = _scan_report(state.get("account"))
-            if not remaining:
-                return {"verify_issues":[],
-                        "trace":[_trace("verify","✅ Verification passed — all issues resolved","success")]}
-            msgs = [f"{i['id']}:{i['count']}" for i in remaining]
-            return {"verify_issues":remaining,
-                    "trace":[_trace("verify",f"⚠ {len(remaining)} issue(s) remain after fix: {', '.join(msgs)}","warning")]}
-        except Exception as e:
-            return {"verify_issues":[],
-                    "trace":[_trace("verify",f"Verify failed: {e}","error")]}
+        """
+        Re-scan. If issues remain and attempts < 3, re-run targeted fixes.
+        On 3rd failed attempt, escalate.
+        """
+        attempt  = state.get("verify_attempts", 0) + 1
+        account  = state.get("account")
+        af       = "AND account = %s" if account and account != "all" else ""
+        ap       = [account] if account and account != "all" else []
+        bw       = f"WHERE 1=1 {af}"
 
+        try:
+            _, remaining = _scan_report(account)
+            if not remaining:
+                return {"verify_issues":[],"verify_attempts":attempt,"status":"fixed",
+                        "trace":[_t("verify",
+                            f"✅ Attempt {attempt}: all issues resolved — mws.report is clean",
+                            "success")]}
+
+            ids = ", ".join(i["id"] for i in remaining)
+            trace = [_t("verify",
+                f"Attempt {attempt}/3: {len(remaining)} issue(s) remain ({ids})",
+                "warning")]
+
+            if attempt >= 3:
+                return {"verify_issues":remaining,"verify_attempts":attempt,"status":"escalated",
+                        "trace": trace + [_t("verify",
+                            "Max retries reached — escalating for manual review","error")]}
+
+            # Re-run targeted fix on remaining issues
+            FIX_SQL = {
+                "redrive":      f"UPDATE mws.report SET status='pending', tries=0 {bw} AND status='failed'",
+                "recopy":       f"UPDATE mws.report SET copy_status='NOT_REPLICATED' {bw} AND status='processed' AND copy_status IS NULL",
+                "redrive_copy": f"UPDATE mws.report SET copy_status='NOT_REPLICATED' {bw} AND status='processed' AND copy_status IS NULL AND download_date < CURRENT_TIMESTAMP - INTERVAL '2 hours'",
+            }
+            retry_results = []
+            conn = get_connection()
+            for issue in remaining:
+                action = issue.get("fix_action")
+                if action and action in FIX_SQL:
+                    cur = conn.cursor()
+                    cur.execute(FIX_SQL[action], ap)
+                    conn.commit()
+                    retry_results.append(action)
+                    trace.append(_t("verify",
+                        f"  ↺ Re-applied {action} for {issue['id']}","info"))
+            conn.close()
+
+            return {"verify_issues":remaining,"verify_attempts":attempt,
+                    "trace": trace + [_t("verify",
+                        f"Re-fixed {len(retry_results)} action(s) — will re-scan","info")]}
+
+        except Exception as e:
+            return {"verify_issues":[],"verify_attempts":attempt,
+                    "trace":[_t("verify",f"Verify error: {e}","error")]}
+
+    def node_escalate(state: ReportTriageState) -> dict:
+        reason = state.get("classification",{}).get("escalate_reason","")
+        issues = state.get("issues",[])
+        msg    = f"{len(issues)} issue(s) escalated for human review"
+        if reason: msg += f": {reason}"
+        return {"status":"escalated",
+                "trace":[_t("escalate", msg, "warning")]}
 
     def node_notify(state: ReportTriageState) -> dict:
         slack_url = os.getenv("SLACK_WEBHOOK_URL","")
-        status    = state.get("status","unknown")
-        issues    = state.get("issues",[])
-        fix_res   = state.get("fix_results",[])
+        st        = state.get("status","unknown")
+        fixes     = state.get("fix_results",[])
         remaining = state.get("verify_issues",[])
+        attempts  = state.get("verify_attempts",0)
 
-        lines = [f"*WF-002 Report Auto-Triage — {status.upper()}*"]
-        lines.append(f"Table: `mws.report` | Issues found: {len(issues)}")
-        for r in fix_res:
-            lines.append(f"  ✓ `{r['action']}`: {r['rows_affected']} rows (before:{r['before']} → after:{r['after']})")
+        emoji = "✅" if st=="fixed" else "⚠️" if st=="escalated" else "ℹ️"
+        lines = [f"*{emoji} WiziAgent Report Triage — {st.upper()}*",
+                 f"Table: `mws.report`"]
+        if fixes:
+            lines.append(f"Fixes applied ({attempts} verify attempt(s)):")
+            for r in fixes:
+                lines.append(f"  ✓ `{r['action']}`: {r['rows_affected']} rows ({r['before']}→{r['after']})")
         if remaining:
-            lines.append(f"  ⚠ {len(remaining)} issue(s) still open — escalation required")
-        msg = "\n".join(lines)
+            lines.append(f"Still open: {', '.join(i['id'] for i in remaining)}")
+        if state.get("approval_status") == "rejected":
+            lines.append("No changes made — approval was rejected or timed out")
 
+        msg = "\n".join(lines)
         notified = False
         if slack_url:
             try:
-                import urllib.request
+                import urllib.request as ur
                 data = json.dumps({"text": msg}).encode()
-                req  = urllib.request.Request(slack_url, data=data,
+                req  = ur.Request(slack_url, data=data,
                         headers={"Content-Type":"application/json"})
-                urllib.request.urlopen(req, timeout=5)
+                ur.urlopen(req, timeout=5)
                 notified = True
             except: pass
 
-        trace_msg = "Slack notification sent" if notified else "Notification logged (no SLACK_WEBHOOK_URL)"
-        return {"notified":notified,
-                "trace":[_trace("notify", trace_msg, "success" if notified else "info")]}
-
+        return {"notified": notified,
+                "trace":[_t("notify",
+                    "Slack notification sent" if notified else "Logged (no SLACK_WEBHOOK_URL)",
+                    "success" if notified else "info")]}
 
     # ── Routing ────────────────────────────────────────────────────────────────
 
     def route_after_classify(state: ReportTriageState) -> str:
-        if state.get("status") == "clean":
-            return "notify"
-        strategy = state.get("classification",{}).get("strategy","auto_fix")
-        if strategy == "escalate":
-            return "escalate"
-        return "auto_fix"   # auto_fix or mixed → attempt fixes
+        if state.get("status") == "clean":      return "notify"
+        if state.get("needs_approval"):          return "request_approval"
+        return "auto_fix"
 
+    def route_after_approval(state: ReportTriageState) -> str:
+        if state.get("approval_status") == "approved": return "auto_fix"
+        return "escalate"
 
-    # ── Build Graph ────────────────────────────────────────────────────────────
+    def route_after_verify(state: ReportTriageState) -> str:
+        remaining = state.get("verify_issues",[])
+        attempts  = state.get("verify_attempts",0)
+        if not remaining:                        return "notify"
+        if attempts >= 3:                        return "notify"
+        return "verify"   # loop back
+
+    # ── Build graph ────────────────────────────────────────────────────────────
 
     def build_triage_graph():
         g = StateGraph(ReportTriageState)
-        g.add_node("scan",     node_scan)
-        g.add_node("classify", node_classify)
-        g.add_node("auto_fix", node_auto_fix)
-        g.add_node("escalate", node_escalate)
-        g.add_node("verify",   node_verify)
-        g.add_node("notify",   node_notify)
+        g.add_node("scan",             node_scan)
+        g.add_node("classify",         node_classify)
+        g.add_node("request_approval", node_request_approval)
+        g.add_node("await_approval",   node_await_approval)
+        g.add_node("auto_fix",         node_auto_fix)
+        g.add_node("escalate",         node_escalate)
+        g.add_node("verify",           node_verify)
+        g.add_node("notify",           node_notify)
 
         g.set_entry_point("scan")
-        g.add_edge("scan",     "classify")
-        g.add_conditional_edges("classify", route_after_classify,
-            {"auto_fix":"auto_fix","escalate":"escalate","notify":"notify"})
-        g.add_edge("auto_fix", "verify")
-        g.add_edge("escalate", "notify")
-        g.add_edge("verify",   "notify")
-        g.add_edge("notify",   LG_END)
-
+        g.add_edge("scan",             "classify")
+        g.add_conditional_edges("classify", route_after_classify, {
+            "request_approval": "request_approval",
+            "auto_fix":         "auto_fix",
+            "notify":           "notify",
+        })
+        g.add_edge("request_approval", "await_approval")
+        g.add_conditional_edges("await_approval", route_after_approval, {
+            "auto_fix":  "auto_fix",
+            "escalate":  "escalate",
+        })
+        g.add_edge("auto_fix",  "verify")
+        g.add_edge("escalate",  "notify")
+        g.add_conditional_edges("verify", route_after_verify, {
+            "verify":  "verify",
+            "notify":  "notify",
+        })
+        g.add_edge("notify", LG_END)
         return g.compile()
 
     _triage_graph = None
-
     def get_triage_graph():
         global _triage_graph
         if _triage_graph is None:
@@ -1277,60 +1418,416 @@ Respond ONLY with valid JSON, no markdown:
         return _triage_graph
 
 
-# ── API Endpoint ───────────────────────────────────────────────────────────────
+# ── WiziAgent — Generic Table Agent ──────────────────────────────────────────
+# Runs on ANY mws table: scan → classify → fix → verify → log
+# Supports approval threshold: auto-fix if affected < threshold, else escalate
 
-@app.post("/api/report/triage-agent")
-async def report_triage_agent(payload: dict = {}):
+if LANGGRAPH_AVAILABLE:
+
+    class TableAgentState(TypedDict):
+        schema:      str
+        table:       str
+        account:     Optional[str]
+        threshold:   int               # row count above which to escalate
+        # scan
+        total_rows:  int
+        alerts:      List[dict]        # from /api/agents/analyze
+        # classify
+        classification: Optional[dict]
+        # fix
+        fix_results: Annotated[List[dict], operator.add]
+        # verify
+        verify_alerts: List[dict]
+        # meta
+        notified:    bool
+        trace:       Annotated[List[dict], operator.add]
+        status:      str
+        error:       Optional[str]
+
+
+    def _t(node, msg, level="info"):
+        return {"node":node,"ts":datetime.datetime.now().strftime("%H:%M:%S"),
+                "msg":msg,"level":level}
+
+
+    def table_node_scan(state: TableAgentState) -> dict:
+        """Run real SQL checks on the target table via existing analyze logic."""
+        schema = state["schema"]; table = state["table"]
+        account = state.get("account")
+        try:
+            # Reuse the analyze endpoint logic directly
+            payload = {"schema":schema,"table":table,"account_id":account,"agent_type":"full"}
+            conn = get_connection()
+            cols = q(conn,"""SELECT column_name,data_type FROM information_schema.columns
+                WHERE table_schema=%s AND table_name=%s ORDER BY ordinal_position""",
+                [schema,table])
+            col_names = [c["column_name"] for c in cols]
+            date_cols = [c["column_name"] for c in cols if "date" in c["data_type"] or "timestamp" in c["data_type"]]
+            num_cols  = [c["column_name"] for c in cols if c["data_type"] in
+                ("integer","bigint","numeric","double precision","real","float")]
+            id_cols   = [c for c in col_names if c.endswith("_id") or c in
+                ("id","amazon_order_id","asin","fnsku","request_id","report_id")]
+            total = q(conn,f"SELECT COUNT(*) AS cnt FROM {schema}.{table}")[0]["cnt"]
+            alerts = []
+            now = datetime.datetime.now().strftime("%I:%M %p")
+
+            for col in id_cols[:5]:
+                try:
+                    nc = q(conn,f"SELECT COUNT(*) AS cnt FROM {schema}.{table} WHERE {col} IS NULL")[0]["cnt"]
+                    if nc:
+                        pct = nc*100//max(total,1)
+                        alerts.append({"id":f"WA-NULL-{col}","title":f"NULL {col}",
+                            "severity":"high" if pct>5 else "medium","count":int(nc),
+                            "fix_type":"flag_nulls","fix_sql":f"UPDATE {schema}.{table} SET {col}='UNKNOWN' WHERE {col} IS NULL",
+                            "table":f"{schema}.{table}","ts":now})
+                except: pass
+
+            for col in [c for c in id_cols if c != "id"][:2]:
+                try:
+                    dc = q(conn,f"""SELECT COUNT(*) AS cnt FROM (
+                        SELECT {col} FROM {schema}.{table} GROUP BY {col} HAVING COUNT(*)>1) d""")[0]["cnt"]
+                    if dc:
+                        alerts.append({"id":f"WA-DUPE-{col}","title":f"Duplicate {col}",
+                            "severity":"critical","count":int(dc),
+                            "fix_type":"delete_dupes",
+                            "fix_sql":f"DELETE FROM {schema}.{table} WHERE id NOT IN (SELECT MIN(id) FROM {schema}.{table} GROUP BY {col})",
+                            "table":f"{schema}.{table}","ts":now})
+                except: pass
+
+            if date_cols:
+                col = date_cols[0]
+                try:
+                    latest = q(conn,f"SELECT MAX({col}) AS mx FROM {schema}.{table}")[0]["mx"]
+                    if latest:
+                        age = (datetime.date.today() - (latest.date() if hasattr(latest,"date") else latest)).days
+                        if age > 2:
+                            alerts.append({"id":f"WA-FRESH-{col}","title":f"Stale data ({age}d old)",
+                                "severity":"high" if age>7 else "medium","count":age,
+                                "fix_type":None,
+                                "fix_sql":None,
+                                "table":f"{schema}.{table}","ts":now})
+                except: pass
+
+            conn.close()
+            msg = f"Scanned {schema}.{table} — {total:,} rows, {len(alerts)} issue(s)"
+            return {"total_rows":int(total),"alerts":alerts,
+                    "trace":[_t("scan",msg,"warning" if alerts else "success")]}
+        except Exception as e:
+            return {"status":"error","error":str(e),
+                    "trace":[_t("scan",f"Scan failed: {e}","error")]}
+
+
+    def table_node_classify(state: TableAgentState) -> dict:
+        alerts    = state.get("alerts",[])
+        threshold = state.get("threshold",50)
+        if not alerts:
+            return {"classification":{"strategy":"clean","fix_actions":[]},"status":"clean",
+                    "trace":[_t("classify","No issues — table is clean","success")]}
+
+        llm = ChatOpenAI(model="gpt-4o",temperature=0,
+                         openai_api_key=os.getenv("OPENAI_API_KEY",""))
+        system = f"""You are WiziAgent, an autonomous data quality agent for Intentwise.
+Analyse these issues on {state['schema']}.{state['table']} and decide the fix strategy.
+Threshold for auto-fix: {threshold} rows. Above threshold → escalate for human review.
+Rules:
+- NULL values on non-critical columns: auto_fix if count < threshold
+- Duplicate primary keys: escalate if count >= threshold (risky delete), else auto_fix
+- Stale data (no fix_sql): escalate with explanation
+- Any fix_sql=null: escalate
+Respond ONLY with JSON (no markdown):
+{{"strategy":"auto_fix|escalate|mixed","auto_fix_ids":["WA-NULL-x"],"escalate_ids":["WA-DUPE-y"],"escalate_reason":"","summary":"one sentence"}}"""
+
+        try:
+            resp = llm.invoke([SystemMessage(content=system),
+                               HumanMessage(content=json.dumps(alerts,indent=2))])
+            text = resp.content.strip().lstrip("```json").rstrip("```").strip()
+            cl   = json.loads(text)
+            return {"classification":cl,
+                    "trace":[_t("classify",f"Strategy: {cl.get('strategy')} — {cl.get('summary','')}","info")]}
+        except Exception as e:
+            # fallback: auto-fix fixable, escalate the rest
+            auto = [a["id"] for a in alerts if a.get("fix_sql")]
+            esc  = [a["id"] for a in alerts if not a.get("fix_sql")]
+            cl   = {"strategy":"mixed","auto_fix_ids":auto,"escalate_ids":esc,
+                    "escalate_reason":"LLM unavailable","summary":"Fallback classification"}
+            return {"classification":cl,
+                    "trace":[_t("classify",f"LLM failed ({e}), fallback used","warning")]}
+
+
+    def table_node_fix(state: TableAgentState) -> dict:
+        alerts = state.get("alerts",[])
+        cl     = state.get("classification",{})
+        auto_ids = cl.get("auto_fix_ids",[])
+        to_fix = [a for a in alerts if a["id"] in auto_ids and a.get("fix_sql")]
+        if not to_fix:
+            return {"fix_results":[],"trace":[_t("fix","No auto-fixable issues","info")]}
+
+        results = []; trace = []
+        try:
+            conn = get_connection()
+            schema = state["schema"]; table = state["table"]
+            for alert in to_fix:
+                before = q(conn,f"SELECT COUNT(*) AS cnt FROM {schema}.{table}")[0]["cnt"]
+                cur = conn.cursor()
+                cur.execute(alert["fix_sql"])
+                conn.commit()
+                after = q(conn,f"SELECT COUNT(*) AS cnt FROM {schema}.{table}")[0]["cnt"]
+                results.append({"alert_id":alert["id"],"title":alert["title"],
+                    "fix_type":alert["fix_type"],"rows_affected":int(before-after),
+                    "before":int(before),"after":int(after)})
+                trace.append(_t("fix",
+                    f"✓ {alert['title']}: {before-after} rows fixed ({before}→{after})","success"))
+            conn.close()
+        except Exception as e:
+            trace.append(_t("fix",f"Fix failed: {e}","error"))
+
+        return {"fix_results":results,"trace":trace,"status":"fixed" if results else "escalated"}
+
+
+    def table_node_escalate(state: TableAgentState) -> dict:
+        cl     = state.get("classification",{})
+        reason = cl.get("escalate_reason","")
+        ids    = cl.get("escalate_ids",[])
+        msg    = f"{len(ids)} issue(s) require human review" + (f": {reason}" if reason else "")
+        return {"status":"escalated","trace":[_t("escalate",msg,"warning")]}
+
+
+    def table_node_verify(state: TableAgentState) -> dict:
+        """Re-scan the table after fixes to confirm issues are resolved."""
+        schema = state["schema"]; table = state["table"]
+        try:
+            conn = get_connection()
+            # Re-check each originally-fixed alert
+            remaining = []
+            for res in state.get("fix_results",[]):
+                alert_id = res["alert_id"]
+                orig = next((a for a in state.get("alerts",[]) if a["id"]==alert_id),None)
+                if not orig: continue
+                # Re-run the count for that check type
+                if "NULL" in alert_id:
+                    col = alert_id.replace("WA-NULL-","")
+                    cnt = q(conn,f"SELECT COUNT(*) AS cnt FROM {schema}.{table} WHERE {col} IS NULL")[0]["cnt"]
+                    if cnt: remaining.append({**orig,"count":int(cnt)})
+                elif "DUPE" in alert_id:
+                    col = alert_id.replace("WA-DUPE-","")
+                    cnt = q(conn,f"""SELECT COUNT(*) AS cnt FROM (
+                        SELECT {col} FROM {schema}.{table} GROUP BY {col} HAVING COUNT(*)>1) d""")[0]["cnt"]
+                    if cnt: remaining.append({**orig,"count":int(cnt)})
+            conn.close()
+            if not remaining:
+                return {"verify_alerts":[],"status":"fixed",
+                        "trace":[_t("verify","✅ All fixes verified — table is clean","success")]}
+            return {"verify_alerts":remaining,
+                    "trace":[_t("verify",f"⚠ {len(remaining)} issue(s) remain after fix","warning")]}
+        except Exception as e:
+            return {"verify_alerts":[],"trace":[_t("verify",f"Verify error: {e}","error")]}
+
+
+    def table_node_notify(state: TableAgentState) -> dict:
+        slack_url = os.getenv("SLACK_WEBHOOK_URL","")
+        tbl   = f"{state['schema']}.{state['table']}"
+        st    = state.get("status","unknown")
+        fixes = state.get("fix_results",[])
+        remaining = state.get("verify_alerts",[])
+        lines = [f"*✨ WiziAgent — {tbl} — {st.upper()}*"]
+        for r in fixes:
+            lines.append(f"  ✓ {r['title']}: {r['rows_affected']} rows fixed ({r['before']}→{r['after']})")
+        if remaining:
+            lines.append(f"  ⚠ {len(remaining)} issue(s) still open — escalation required")
+        if state.get("classification",{}).get("escalate_reason"):
+            lines.append(f"  Escalation: {state['classification']['escalate_reason']}")
+        msg = "\n".join(lines)
+        notified = False
+        if slack_url:
+            try:
+                import urllib.request
+                data = json.dumps({"text":msg}).encode()
+                req  = urllib.request.Request(slack_url,data=data,
+                        headers={"Content-Type":"application/json"})
+                urllib.request.urlopen(req,timeout=5)
+                notified = True
+            except: pass
+        return {"notified":notified,"trace":[_t("notify",
+            "Slack notification sent" if notified else "Logged (no SLACK_WEBHOOK_URL)",
+            "success" if notified else "info")]}
+
+
+    def table_route_classify(state: TableAgentState) -> str:
+        if state.get("status") == "clean":   return "notify"
+        st = state.get("classification",{}).get("strategy","auto_fix")
+        if st == "escalate":                  return "escalate"
+        return "auto_fix"   # auto_fix or mixed
+
+
+    def build_table_agent_graph():
+        g = StateGraph(TableAgentState)
+        g.add_node("scan",     table_node_scan)
+        g.add_node("classify", table_node_classify)
+        g.add_node("auto_fix", table_node_fix)
+        g.add_node("escalate", table_node_escalate)
+        g.add_node("verify",   table_node_verify)
+        g.add_node("notify",   table_node_notify)
+        g.set_entry_point("scan")
+        g.add_edge("scan",     "classify")
+        g.add_conditional_edges("classify", table_route_classify,
+            {"auto_fix":"auto_fix","escalate":"escalate","notify":"notify"})
+        g.add_edge("auto_fix", "verify")
+        g.add_edge("escalate", "notify")
+        g.add_edge("verify",   "notify")
+        g.add_edge("notify",   LG_END)
+        return g.compile()
+
+    _table_agent_graph = None
+    def get_table_agent_graph():
+        global _table_agent_graph
+        if _table_agent_graph is None:
+            _table_agent_graph = build_table_agent_graph()
+        return _table_agent_graph
+
+
+@app.post("/api/wizi-agent/run-table")
+async def wizi_agent_run_table(payload: dict = {}):
     """
-    Run the LangGraph WF-002 triage agent on mws.report.
-    Body: { "account": "optional_account_id", "dry_run": false }
-    Returns: { status, trace, issues, fix_results, verify_issues, notified, total_rows }
+    Run WiziAgent on any mws table.
+    Body: { "schema": "mws", "table": "orders", "account": "...", "threshold": 50, "dry_run": false }
+    Returns: { status, trace, alerts, fix_results, verify_alerts, notified, total_rows }
     """
     if not LANGGRAPH_AVAILABLE:
-        return {
-            "error": "LangGraph not installed. Add to requirements.txt: langgraph>=0.2.0 langchain-openai>=0.1.0",
-            "install_cmd": "pip install langgraph langchain-openai"
-        }
+        return {"error":"LangGraph not installed. pip install langgraph langchain-openai"}
 
-    account = payload.get("account")
-    dry_run = payload.get("dry_run", False)
+    schema    = payload.get("schema","mws")
+    table     = payload.get("table","")
+    account   = payload.get("account")
+    threshold = int(payload.get("threshold",50))
+    dry_run   = payload.get("dry_run",False)
 
-    initial_state: ReportTriageState = {
-        "account":        account,
-        "total_rows":     0,
-        "issues":         [],
-        "classification": None,
-        "fix_results":    [],
-        "verify_issues":  [],
-        "notified":       False,
-        "trace":          [],
-        "status":         "running",
-        "error":          None,
+    if not table:
+        return {"error":"table is required"}
+
+    init: TableAgentState = {
+        "schema":schema,"table":table,"account":account,
+        "threshold":threshold,"total_rows":0,"alerts":[],
+        "classification":None,"fix_results":[],"verify_alerts":[],
+        "notified":False,"trace":[],"status":"running","error":None,
     }
 
-    # In dry_run mode, skip auto_fix node by patching classification strategy
     if dry_run:
-        initial_state["classification"] = {
-            "strategy": "escalate",
-            "fix_actions": [],
-            "escalate_reason": "dry_run=true — no changes made",
-            "summary": "Dry run: scan + classify only"
+        init["classification"] = {
+            "strategy":"escalate","auto_fix_ids":[],"escalate_ids":[],
+            "escalate_reason":"dry_run=true","summary":"Dry run — scan only"}
+
+    try:
+        graph  = get_table_agent_graph()
+        result = await asyncio.to_thread(graph.invoke, init)
+        return {
+            "status":         result.get("status"),
+            "schema":         schema, "table": table,
+            "total_rows":     result.get("total_rows",0),
+            "alerts":         result.get("alerts",[]),
+            "classification": result.get("classification"),
+            "fix_results":    result.get("fix_results",[]),
+            "verify_alerts":  result.get("verify_alerts",[]),
+            "notified":       result.get("notified",False),
+            "trace":          result.get("trace",[]),
+            "error":          result.get("error"),
+        }
+    except Exception as e:
+        return {"error":str(e),"status":"error",
+                "trace":[{"node":"agent","ts":"","msg":str(e),"level":"error"}]}
+
+@app.post("/api/wizi-agent/run")
+async def wizi_agent_run(payload: dict = {}):
+    """
+    Run WiziAgent on mws.report.
+    Body: {
+      "account":   optional account filter,
+      "dry_run":   true = scan+classify only (no fixes),
+      "threshold": row count above which approval is required (default 50)
+    }
+    Returns: { status, trace, issues, fix_results, verify_issues,
+               approval_token (if awaiting_approval), notified, total_rows }
+    """
+    if not LANGGRAPH_AVAILABLE:
+        return {"error": "LangGraph not installed. pip install langgraph langchain-openai"}
+
+    account   = payload.get("account")
+    dry_run   = payload.get("dry_run", False)
+    threshold = int(payload.get("threshold", 50))
+
+    initial: ReportTriageState = {
+        "account":         account,
+        "total_rows":      0,
+        "issues":          [],
+        "classification":  None,
+        "needs_approval":  False,
+        "approval_token":  None,
+        "approval_status": "skipped",
+        "threshold":       threshold,
+        "fix_results":     [],
+        "verify_attempts": 0,
+        "verify_issues":   [],
+        "notified":        False,
+        "trace":           [],
+        "status":          "running",
+        "error":           None,
+    }
+
+    if dry_run:
+        initial["classification"] = {
+            "strategy":"escalate","fix_actions":[],"needs_approval":False,
+            "escalate_reason":"dry_run=true","summary":"Dry run: scan + classify only",
+            "risk_reason":""
         }
 
     try:
         graph  = get_triage_graph()
-        result = await asyncio.to_thread(graph.invoke, initial_state)
+        result = await asyncio.to_thread(graph.invoke, initial)
         return {
-            "status":        result.get("status","unknown"),
-            "total_rows":    result.get("total_rows",0),
-            "issues":        result.get("issues",[]),
-            "classification":result.get("classification"),
-            "fix_results":   result.get("fix_results",[]),
-            "verify_issues": result.get("verify_issues",[]),
-            "notified":      result.get("notified",False),
-            "trace":         result.get("trace",[]),
-            "error":         result.get("error"),
+            "status":          result.get("status","unknown"),
+            "total_rows":      result.get("total_rows",0),
+            "issues":          result.get("issues",[]),
+            "classification":  result.get("classification"),
+            "needs_approval":  result.get("needs_approval",False),
+            "approval_token":  result.get("approval_token"),
+            "approval_status": result.get("approval_status","skipped"),
+            "fix_results":     result.get("fix_results",[]),
+            "verify_attempts": result.get("verify_attempts",0),
+            "verify_issues":   result.get("verify_issues",[]),
+            "notified":        result.get("notified",False),
+            "trace":           result.get("trace",[]),
+            "error":           result.get("error"),
         }
     except Exception as e:
-        return {"error": str(e), "status": "error",
-                "trace": [{"node":"agent","ts":"","msg":str(e),"level":"error"}]}
+        return {"error":str(e),"status":"error",
+                "trace":[{"node":"agent","ts":"","msg":str(e),"level":"error"}]}
+
+
+@app.post("/api/wizi-agent/approve")
+def wizi_agent_approve(payload: dict = {}):
+    """
+    Submit an approval decision for a pending WiziAgent run.
+    Body: { "token": "abc12345", "decision": "approve" | "reject" }
+    """
+    token    = payload.get("token","")
+    decision = payload.get("decision","reject")
+    entry    = _approval_store.get(token)
+    if not entry:
+        return {"error": f"Token '{token}' not found or already resolved"}
+    entry["decision"] = decision
+    entry["event"].set()   # unblock node_await_approval
+    return {"token": token, "decision": decision, "accepted": True}
+
+
+@app.get("/api/wizi-agent/status/{token}")
+def wizi_agent_status(token: str):
+    """
+    Poll approval status for a pending WiziAgent run.
+    Returns: { token, decision, resolved }
+    """
+    entry = _approval_store.get(token)
+    if not entry:
+        return {"token": token, "decision": None, "resolved": False,
+                "error": "Token not found"}
+    return {"token":    token,
+            "decision": entry.get("decision"),
+            "resolved": entry.get("decision") is not None}
