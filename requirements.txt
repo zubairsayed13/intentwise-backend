@@ -4,3 +4,5 @@ psycopg2-binary
 python-dotenv
 httpx
 anthropic
+langgraph>=0.2.0
+langchain-openai>=0.1.0
