@@ -359,30 +359,148 @@ def detect_alerts(account_id: str = Query("all")):
 
 # ── AI Agent analyze ──────────────────────────────────────────────────────────
 @app.post("/api/agents/analyze")
-async def ai_analyze(payload: dict):
-    table=payload.get("table",""); schema=payload.get("schema","mws"); findings=payload.get("findings",[])
-    api_key=os.getenv("ANTHROPIC_API_KEY","")
-    if not api_key: return {"error":"ANTHROPIC_API_KEY not set"}
-    prompt=f"""You are a senior data quality engineer analyzing Amazon MWS data in Redshift.
-Table: {schema}.{table}
-Findings: {json.dumps(findings,indent=2,default=str)}
+def ai_analyze(payload: dict):
+    """
+    Analyze a table for data quality issues.
+    agent_type: "full" | "nulls" | "duplicates" | "freshness" | "range" | "schema"
+    Returns { alerts: [], summary, quality_score }
+    """
+    table      = payload.get("table", "")
+    schema     = payload.get("schema", "mws")
+    account_id = payload.get("account_id")
+    agent_type = payload.get("agent_type", "full")
 
-Tasks:
-1. Analyze findings in plain English
-2. Write 5 specific SQL test cases for this table
-3. Identify patterns/root causes
-4. Give data quality score 0-100
+    if not table:
+        return {"error": "table is required"}
 
-Respond ONLY in this JSON format:
-{{"summary":"...","quality_score":85,"score_reason":"...","test_cases":[{{"id":"TC-001","name":"...","description":"...","sql":"SELECT ...","severity":"critical|high|medium|low","expected":"..."}}],"root_causes":["..."],"recommendations":["..."]}}"""
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp=await client.post("https://api.anthropic.com/v1/messages",
-            headers={"x-api-key":api_key,"anthropic-version":"2023-06-01","content-type":"application/json"},
-            json={"model":"claude-sonnet-4-20250514","max_tokens":2000,"messages":[{"role":"user","content":prompt}]})
-    data=resp.json()
-    text=data["content"][0]["text"] if data.get("content") else ""
-    try: return json.loads(text)
-    except: return {"raw":text,"error":"Could not parse JSON"}
+    full_table = f"{schema}.{table}"
+    alerts = []
+
+    try:
+        conn = get_connection()
+
+        # ── Check table exists ───────────────────────────────────────────────
+        exists = q(conn, """
+            SELECT COUNT(*) AS cnt FROM information_schema.tables
+            WHERE table_schema=%s AND table_name=%s
+        """, [schema, table])
+        if not exists or exists[0]["cnt"] == 0:
+            conn.close()
+            return {"alerts": [], "summary": f"Table {full_table} not found", "quality_score": None}
+
+        # ── Get columns ──────────────────────────────────────────────────────
+        cols = q(conn, """
+            SELECT column_name, data_type FROM information_schema.columns
+            WHERE table_schema=%s AND table_name=%s ORDER BY ordinal_position
+        """, [schema, table])
+        col_names   = [c["column_name"] for c in cols]
+        date_cols   = [c["column_name"] for c in cols if "date" in c["data_type"] or "timestamp" in c["data_type"]]
+        num_cols    = [c["column_name"] for c in cols if c["data_type"] in ("integer","bigint","numeric","double precision","real","float")]
+        id_cols     = [c for c in col_names if c.endswith("_id") or c in ("id","amazon_order_id","asin","fnsku","merchant_sku")]
+
+        total = q(conn, f"SELECT COUNT(*) AS cnt FROM {full_table}")[0]["cnt"]
+        if total == 0:
+            conn.close()
+            return {"alerts": [], "summary": f"{full_table} is empty", "quality_score": 100, "total_rows": 0}
+
+        # ── NULL checks ──────────────────────────────────────────────────────
+        if agent_type in ("full", "nulls"):
+            for col in id_cols[:6]:
+                try:
+                    null_count = q(conn, f"SELECT COUNT(*) AS cnt FROM {full_table} WHERE {col} IS NULL")[0]["cnt"]
+                    if null_count > 0:
+                        alerts.append({
+                            "id":       f"AGT-{schema[:3].upper()}-NULL-{col}",
+                            "title":    f"NULL {col} in {full_table}",
+                            "severity": "high" if null_count / max(total,1) > 0.05 else "medium",
+                            "table":    full_table,
+                            "source":   "redshift-staging",
+                            "status":   "open",
+                            "ts":       __import__("datetime").datetime.now().strftime("%I:%M %p"),
+                            "message":  f"{null_count:,} of {total:,} rows ({null_count*100//max(total,1)}%) have NULL {col}",
+                            "count":    int(null_count),
+                        })
+                except: pass
+
+        # ── Duplicate checks ─────────────────────────────────────────────────
+        if agent_type in ("full", "duplicates"):
+            pk_candidates = [c for c in id_cols if c != "id"][:2]
+            for col in pk_candidates:
+                try:
+                    dupe_count = q(conn, f"""
+                        SELECT COUNT(*) AS cnt FROM (
+                            SELECT {col} FROM {full_table}
+                            GROUP BY {col} HAVING COUNT(*) > 1
+                        ) d
+                    """)[0]["cnt"]
+                    if dupe_count > 0:
+                        alerts.append({
+                            "id":       f"AGT-{schema[:3].upper()}-DUPE-{col}",
+                            "title":    f"Duplicate {col} in {full_table}",
+                            "severity": "critical",
+                            "table":    full_table,
+                            "source":   "redshift-staging",
+                            "status":   "open",
+                            "ts":       __import__("datetime").datetime.now().strftime("%I:%M %p"),
+                            "message":  f"{dupe_count:,} duplicate values of {col} found",
+                            "count":    int(dupe_count),
+                        })
+                except: pass
+
+        # ── Freshness checks ─────────────────────────────────────────────────
+        if agent_type in ("full", "freshness") and date_cols:
+            col = date_cols[0]
+            try:
+                latest = q(conn, f"SELECT MAX({col}) AS mx FROM {full_table}")[0]["mx"]
+                if latest:
+                    import datetime
+                    age_days = (datetime.date.today() - (latest.date() if hasattr(latest,"date") else latest)).days
+                    if age_days > 2:
+                        alerts.append({
+                            "id":       f"AGT-{schema[:3].upper()}-FRESH-{col}",
+                            "title":    f"Stale data in {full_table}",
+                            "severity": "high" if age_days > 7 else "medium",
+                            "table":    full_table,
+                            "source":   "redshift-staging",
+                            "status":   "open",
+                            "ts":       __import__("datetime").datetime.now().strftime("%I:%M %p"),
+                            "message":  f"Latest {col} is {age_days} days old",
+                            "count":    age_days,
+                        })
+            except: pass
+
+        # ── Range checks ─────────────────────────────────────────────────────
+        if agent_type in ("full", "range") and num_cols:
+            for col in num_cols[:3]:
+                try:
+                    neg = q(conn, f"SELECT COUNT(*) AS cnt FROM {full_table} WHERE {col} < 0")[0]["cnt"]
+                    if neg > 0:
+                        alerts.append({
+                            "id":       f"AGT-{schema[:3].upper()}-RANGE-{col}",
+                            "title":    f"Negative {col} in {full_table}",
+                            "severity": "medium",
+                            "table":    full_table,
+                            "source":   "redshift-staging",
+                            "status":   "open",
+                            "ts":       __import__("datetime").datetime.now().strftime("%I:%M %p"),
+                            "message":  f"{neg:,} rows have negative {col}",
+                            "count":    int(neg),
+                        })
+                except: pass
+
+        conn.close()
+        score = max(0, 100 - len(alerts) * 15)
+        return {
+            "alerts":        alerts,
+            "total_rows":    int(total),
+            "quality_score": score,
+            "agent_type":    agent_type,
+            "summary":       f"{len(alerts)} issue(s) found in {full_table} ({total:,} rows)",
+            "columns":       col_names,
+        }
+
+    except Exception as e:
+        return {"error": str(e), "alerts": []}
 
 # ── Full scan ─────────────────────────────────────────────────────────────────
 @app.post("/api/agents/full-scan")
@@ -563,6 +681,304 @@ async def remediation_notify(payload: dict):
                 ]
             }, timeout=10)
         return {"sent": resp.status_code == 200, "status": resp.status_code}
+    except Exception as e:
+        return {"error": str(e)}
+# ── Flow Builder — Save / Load / Schedule ─────────────────────────────────────
+# Flows stored in memory (replace with DB in production)
+_SAVED_FLOWS = {}
+
+class FlowSaveRequest(BaseModel):
+    flow_id:     str
+    name:        str
+    description: str = ""
+    steps:       list
+    schedule:    dict = {}   # { enabled, cron, timezone }
+
+@app.post("/api/flows/save")
+def save_flow(req: FlowSaveRequest):
+    import datetime
+    _SAVED_FLOWS[req.flow_id] = {
+        "flow_id":     req.flow_id,
+        "name":        req.name,
+        "description": req.description,
+        "steps":       req.steps,
+        "schedule":    req.schedule,
+        "saved_at":    datetime.datetime.now().isoformat(),
+        "last_run":    None,
+        "run_count":   0,
+    }
+    return {"saved": True, "flow_id": req.flow_id}
+
+@app.get("/api/flows")
+def list_flows():
+    return list(_SAVED_FLOWS.values())
+
+@app.get("/api/flows/{flow_id}")
+def get_flow(flow_id: str):
+    if flow_id not in _SAVED_FLOWS:
+        return {"error": "Flow not found"}
+    return _SAVED_FLOWS[flow_id]
+
+@app.post("/api/flows/{flow_id}/run")
+def run_flow(flow_id: str, payload: dict = {}):
+    """
+    Execute a saved flow step by step.
+    Returns per-step results. SELECT steps run immediately.
+    FIX steps return requires_approval=True and do NOT execute unless payload.approved=True.
+    """
+    if flow_id not in _SAVED_FLOWS:
+        return {"error": "Flow not found"}
+
+    flow     = _SAVED_FLOWS[flow_id]
+    steps    = flow["steps"]
+    approved = payload.get("approved_steps", [])  # list of step ids approved by human
+    results  = []
+
+    try:
+        conn = get_connection()
+        for step in steps:
+            sid   = step.get("id")
+            stype = step.get("type")   # "select" | "fix" | "notify" | "condition"
+            sql   = step.get("sql", "").strip()
+            label = step.get("label", sid)
+
+            if stype == "select":
+                try:
+                    rows = q(conn, sql)
+                    results.append({ "step_id": sid, "label": label, "type": stype,
+                        "status": "done", "rows": rows[:50], "row_count": len(rows) })
+                except Exception as e:
+                    results.append({ "step_id": sid, "label": label, "type": stype,
+                        "status": "error", "error": str(e) })
+
+            elif stype == "fix":
+                if sid not in approved:
+                    # Preview only — count affected rows
+                    count_sql = step.get("count_sql", f"SELECT COUNT(*) AS cnt FROM ({sql}) x")
+                    try:
+                        count = q(conn, count_sql)[0].get("cnt", 0)
+                    except:
+                        count = "unknown"
+                    results.append({ "step_id": sid, "label": label, "type": stype,
+                        "status": "awaiting_approval", "requires_approval": True,
+                        "preview_count": count, "sql": sql })
+                else:
+                    # Human approved — execute
+                    try:
+                        cur = conn.cursor()
+                        cur.execute(sql)
+                        conn.commit()
+                        before = payload.get("before_counts", {}).get(sid, 0)
+                        results.append({ "step_id": sid, "label": label, "type": stype,
+                            "status": "done", "executed": True, "rows_affected": cur.rowcount })
+                    except Exception as e:
+                        results.append({ "step_id": sid, "label": label, "type": stype,
+                            "status": "error", "error": str(e) })
+
+            elif stype == "condition":
+                # Evaluate a SELECT that returns a single boolean-ish value
+                try:
+                    rows = q(conn, sql)
+                    val  = list(rows[0].values())[0] if rows else 0
+                    passed = bool(val) if not isinstance(val, (int,float)) else val > 0
+                    results.append({ "step_id": sid, "label": label, "type": stype,
+                        "status": "done", "passed": passed, "value": str(val) })
+                except Exception as e:
+                    results.append({ "step_id": sid, "label": label, "type": stype,
+                        "status": "error", "error": str(e) })
+
+            elif stype == "notify":
+                results.append({ "step_id": sid, "label": label, "type": stype,
+                    "status": "done", "message": step.get("message", "Flow step completed") })
+
+        conn.close()
+        import datetime
+        _SAVED_FLOWS[flow_id]["last_run"]  = datetime.datetime.now().isoformat()
+        _SAVED_FLOWS[flow_id]["run_count"] += 1
+        return { "flow_id": flow_id, "status": "complete", "steps": results }
+
+    except Exception as e:
+        return {"error": str(e), "steps": results}
+
+
+# ── Report Status Auto-Triage ─────────────────────────────────────────────────
+# Schema: mws.report
+# Columns: request_id, report_id, report_type, period_start_date, period_end_date,
+#          requested_date, download_date, report_processing_time, tries, status,
+#          account, period_start_time, period_end_time, precheck_status, copy_status
+# status:      pending | processed | failed
+# copy_status: REPLICATED | NOT_REPLICATED | NULL
+
+@app.get("/api/report/triage")
+def report_triage(account: str = None):
+    """
+    Scan mws.report for 3 issues:
+      RPT-001 — Failed/pending downloads   (status != 'processed')
+      RPT-002 — Not replicated             (copy_status != 'REPLICATED' or NULL)
+      RPT-003 — Stuck reports              (processed but not replicated for >2h)
+    """
+    try:
+        conn = get_connection()
+
+        # account filter — column is called 'account' not 'account_id'
+        af = "AND account = %s" if account and account != "all" else ""
+        ap = [account] if account and account != "all" else []
+
+        base_where = f"WHERE 1=1 {af}"
+
+        total = q(conn, f"SELECT COUNT(*) AS cnt FROM mws.report {base_where}", ap)[0]["cnt"]
+        issues = []
+
+        # ── RPT-001: Failed / still-pending downloads ─────────────────────────
+        failed_rows = q(conn, f"""
+            SELECT status, COUNT(*) AS cnt
+            FROM mws.report {base_where}
+            AND status != 'processed'
+            GROUP BY status ORDER BY cnt DESC
+        """, ap)
+        failed_count = sum(r["cnt"] for r in failed_rows)
+        if failed_count:
+            samples = q(conn, f"""
+                SELECT request_id, report_type, status, copy_status,
+                       download_date, tries, account
+                FROM mws.report {base_where}
+                AND status != 'processed'
+                ORDER BY requested_date DESC LIMIT 5
+            """, ap)
+            issues.append({
+                "id":          "RPT-001",
+                "title":       "Failed / pending downloads",
+                "severity":    "critical" if failed_count > 20 else "high",
+                "count":       int(failed_count),
+                "breakdown":   [{"status": r["status"], "count": int(r["cnt"])} for r in failed_rows],
+                "samples":     [dict(r) for r in samples],
+                "fix_action":  "redrive",
+                "description": f"{failed_count} reports with status != 'processed'",
+            })
+
+        # ── RPT-002: Not replicated to Redshift ──────────────────────────────
+        not_rep = q(conn, f"""
+            SELECT COUNT(*) AS cnt FROM mws.report {base_where}
+            AND (copy_status != 'REPLICATED' OR copy_status IS NULL)
+        """, ap)[0]["cnt"]
+        if not_rep:
+            samples = q(conn, f"""
+                SELECT request_id, report_type, status, copy_status,
+                       download_date, tries, account
+                FROM mws.report {base_where}
+                AND (copy_status != 'REPLICATED' OR copy_status IS NULL)
+                ORDER BY download_date DESC LIMIT 5
+            """, ap)
+            breakdown_rows = q(conn, f"""
+                SELECT COALESCE(copy_status, 'NULL') AS copy_status, COUNT(*) AS cnt
+                FROM mws.report {base_where}
+                AND (copy_status != 'REPLICATED' OR copy_status IS NULL)
+                GROUP BY 1 ORDER BY cnt DESC
+            """, ap)
+            issues.append({
+                "id":          "RPT-002",
+                "title":       "Reports not replicated to Redshift",
+                "severity":    "high",
+                "count":       int(not_rep),
+                "breakdown":   [{"status": r["copy_status"], "count": int(r["cnt"])} for r in breakdown_rows],
+                "samples":     [dict(r) for r in samples],
+                "fix_action":  "recopy",
+                "description": f"{not_rep} reports with copy_status != 'REPLICATED' (or NULL)",
+            })
+
+        # ── RPT-003: Stuck — processed but not replicated for >2h ────────────
+        stuck = q(conn, f"""
+            SELECT COUNT(*) AS cnt FROM mws.report {base_where}
+            AND status = 'processed'
+            AND (copy_status IS NULL OR copy_status = 'NOT_REPLICATED')
+            AND download_date < CURRENT_TIMESTAMP - INTERVAL '2 hours'
+        """, ap)[0]["cnt"]
+        if stuck:
+            samples = q(conn, f"""
+                SELECT request_id, report_type, status, copy_status,
+                       download_date, tries, account
+                FROM mws.report {base_where}
+                AND status = 'processed'
+                AND (copy_status IS NULL OR copy_status = 'NOT_REPLICATED')
+                AND download_date < CURRENT_TIMESTAMP - INTERVAL '2 hours'
+                ORDER BY download_date ASC LIMIT 5
+            """, ap)
+            issues.append({
+                "id":          "RPT-003",
+                "title":       "Stuck — processed but not replicated >2h",
+                "severity":    "high",
+                "count":       int(stuck),
+                "breakdown":   [],
+                "samples":     [dict(r) for r in samples],
+                "fix_action":  "redrive_copy",
+                "description": f"{stuck} reports downloaded but copy stuck >2h",
+            })
+
+        conn.close()
+        import datetime
+        return {
+            "table":       "mws.report",
+            "total_rows":  int(total),
+            "scanned_at":  datetime.datetime.now().isoformat(),
+            "issues":      issues,
+            "clean":       len(issues) == 0,
+        }
+    except Exception as e:
+        return {"error": str(e), "issues": []}
+
+
+@app.post("/api/report/fix")
+def report_fix(payload: dict):
+    """
+    Execute a fix on mws.report.
+    fix_action: redrive | recopy | redrive_copy
+    dry_run: bool (default True)
+    account: optional account filter
+    """
+    fix_action = payload.get("fix_action", "")
+    dry_run    = payload.get("dry_run", True)
+    account    = payload.get("account")
+    af         = "AND account = %s" if account and account != "all" else ""
+    ap         = [account] if account and account != "all" else []
+    base_where = f"WHERE 1=1 {af}"
+
+    FIX_MAP = {
+        "redrive": (
+            f"SELECT COUNT(*) AS cnt FROM mws.report {base_where} AND status != 'processed'",
+            f"UPDATE mws.report SET status = 'pending', tries = 0 {base_where} AND status = 'failed'"
+        ),
+        "recopy": (
+            f"SELECT COUNT(*) AS cnt FROM mws.report {base_where} AND (copy_status != 'REPLICATED' OR copy_status IS NULL)",
+            f"UPDATE mws.report SET copy_status = 'NOT_REPLICATED' {base_where} AND status = 'processed' AND (copy_status IS NULL)"
+        ),
+        "redrive_copy": (
+            f"SELECT COUNT(*) AS cnt FROM mws.report {base_where} AND status='processed' AND (copy_status IS NULL OR copy_status='NOT_REPLICATED') AND download_date < CURRENT_TIMESTAMP - INTERVAL '2 hours'",
+            f"UPDATE mws.report SET copy_status = 'NOT_REPLICATED' {base_where} AND status='processed' AND copy_status IS NULL AND download_date < CURRENT_TIMESTAMP - INTERVAL '2 hours'"
+        ),
+    }
+
+    if fix_action not in FIX_MAP:
+        return {"error": f"Unknown fix_action: {fix_action}"}
+
+    try:
+        conn = get_connection()
+        count_sql, fix_sql = FIX_MAP[fix_action]
+        before   = q(conn, f"SELECT COUNT(*) AS cnt FROM mws.report {base_where}", ap)[0]["cnt"]
+        affected = q(conn, count_sql, ap)[0]["cnt"]
+
+        if dry_run:
+            conn.close()
+            return {"dry_run": True, "fix_action": fix_action,
+                    "rows_affected": int(affected), "before": int(before)}
+
+        cur = conn.cursor()
+        cur.execute(fix_sql, ap)
+        conn.commit()
+        after = q(conn, f"SELECT COUNT(*) AS cnt FROM mws.report {base_where}", ap)[0]["cnt"]
+        conn.close()
+        return {"dry_run": False, "fix_action": fix_action,
+                "rows_affected": int(affected), "before": int(before),
+                "after": int(after), "success": True}
     except Exception as e:
         return {"error": str(e)}
 
