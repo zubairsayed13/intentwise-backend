@@ -55,6 +55,38 @@ def get_accounts():
         return {"error": str(e)}
 
 # ── Tables ────────────────────────────────────────────────────────────────────
+@app.get("/api/schema")
+def get_full_schema():
+    """
+    Returns all tables + columns in one shot for AI context injection.
+    Response: [{ table_schema, table_name, columns: [{column_name, data_type}] }]
+    """
+    try:
+        conn = get_connection()
+        rows = q(conn, """
+            SELECT c.table_schema, c.table_name, c.column_name, c.data_type
+            FROM information_schema.columns c
+            JOIN information_schema.tables t
+              ON c.table_schema = t.table_schema AND c.table_name = t.table_name
+            WHERE t.table_type = 'BASE TABLE'
+              AND c.table_schema NOT IN ('pg_catalog','information_schema','pg_internal')
+            ORDER BY c.table_schema, c.table_name, c.ordinal_position
+        """)
+        conn.close()
+        # Group into { schema.table -> [cols] }
+        grouped = {}
+        for r in rows:
+            key = (r["table_schema"], r["table_name"])
+            if key not in grouped:
+                grouped[key] = []
+            grouped[key].append({"column_name": r["column_name"], "data_type": r["data_type"]})
+        return [
+            {"table_schema": k[0], "table_name": k[1], "columns": v}
+            for k, v in grouped.items()
+        ]
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.get("/api/tables")
 def get_tables():
     try:
@@ -920,8 +952,131 @@ def report_triage(account: str = None):
                 "description": f"{stuck} reports downloaded but copy stuck >2h",
             })
 
+
+        # ── RPT-004: NULL counts per column ─────────────────────────────────
+        col_rows = q(conn,
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema='mws' AND table_name='report' ORDER BY ordinal_position")
+        null_findings = []
+        for cr in col_rows:
+            col = cr["column_name"]
+            cnt = q(conn, f"SELECT COUNT(*) AS cnt FROM mws.report {base_where} AND {col} IS NULL", ap)[0]["cnt"]
+            if cnt:
+                null_findings.append({"column": col, "null_count": int(cnt)})
+        if null_findings:
+            issues.append({
+                "id": "RPT-004", "title": "Missing values in columns",
+                "severity": "high" if any(f["null_count"] > 100 for f in null_findings) else "medium",
+                "count": sum(f["null_count"] for f in null_findings),
+                "breakdown": [{"status": f["column"], "count": f["null_count"]} for f in null_findings],
+                "samples": [], "fix_action": None,
+                "description": f"NULLs in {len(null_findings)} column(s): " + ", ".join(f["column"] for f in null_findings),
+            })
+
+        # ── RPT-005: Duplicate request_id ────────────────────────────────────
+        dupe_cnt = q(conn,
+            f"SELECT COUNT(*) AS cnt FROM ("
+            f"SELECT request_id FROM mws.report {base_where} GROUP BY request_id HAVING COUNT(*) > 1) d",
+            ap)[0]["cnt"]
+        if dupe_cnt:
+            dupe_samples = q(conn,
+                f"SELECT request_id, COUNT(*) AS occurrences FROM mws.report {base_where} "
+                f"GROUP BY request_id HAVING COUNT(*) > 1 ORDER BY occurrences DESC LIMIT 5", ap)
+            issues.append({
+                "id": "RPT-005", "title": "Duplicate report requests",
+                "severity": "high", "count": int(dupe_cnt), "breakdown": [],
+                "samples": [dict(r) for r in dupe_samples], "fix_action": None,
+                "description": f"{dupe_cnt} request_id(s) appear more than once",
+            })
+
+        # ── RPT-006: Freshness ────────────────────────────────────────────────
+        fresh = q(conn, f"SELECT MAX(requested_date)::text AS latest FROM mws.report {base_where}", ap)
+        latest_dt = fresh[0]["latest"] if fresh else None
+        if latest_dt:
+            try:
+                lat = datetime.datetime.fromisoformat(str(latest_dt)[:19])
+                age_h = (datetime.datetime.utcnow() - lat).total_seconds() / 3600
+                if age_h > 26:
+                    issues.append({
+                        "id": "RPT-006", "title": "Stale data — no recent requests",
+                        "severity": "critical" if age_h > 48 else "high",
+                        "count": 1, "breakdown": [], "samples": [], "fix_action": None,
+                        "description": f"Latest requested_date is {round(age_h,1)}h ago ({str(latest_dt)[:19]})",
+                    })
+            except Exception:
+                pass
+
+        # ── RPT-007: Invalid enum values ─────────────────────────────────────
+        bad_status = q(conn,
+            f"SELECT status, COUNT(*) AS cnt FROM mws.report {base_where} "
+            f"AND status NOT IN ('pending','processed','failed') GROUP BY status", ap)
+        bad_copy = q(conn,
+            f"SELECT copy_status, COUNT(*) AS cnt FROM mws.report {base_where} "
+            f"AND copy_status IS NOT NULL AND copy_status NOT IN ('REPLICATED','NOT_REPLICATED') "
+            f"GROUP BY copy_status", ap)
+        if bad_status or bad_copy:
+            breakdown = (
+                [{"status": f"status={r['status']}", "count": int(r["cnt"])} for r in bad_status] +
+                [{"status": f"copy_status={r['copy_status']}", "count": int(r["cnt"])} for r in bad_copy]
+            )
+            issues.append({
+                "id": "RPT-007", "title": "Invalid enum values",
+                "severity": "high", "count": sum(b["count"] for b in breakdown),
+                "breakdown": breakdown, "samples": [], "fix_action": None,
+                "description": "Unexpected values in status or copy_status columns",
+            })
+
+        # ── RPT-008: Stale pending rows (stuck > 4h) ─────────────────────────
+        stale_pending = q(conn,
+            f"SELECT COUNT(*) AS cnt FROM mws.report {base_where} "
+            f"AND status = 'pending' AND requested_date < CURRENT_TIMESTAMP - INTERVAL '4 hours'", ap)[0]["cnt"]
+        if stale_pending:
+            sp_samples = q(conn,
+                f"SELECT request_id, report_type, status, tries, requested_date, account "
+                f"FROM mws.report {base_where} AND status = 'pending' "
+                f"AND requested_date < CURRENT_TIMESTAMP - INTERVAL '4 hours' "
+                f"ORDER BY requested_date ASC LIMIT 5", ap)
+            issues.append({
+                "id": "RPT-008", "title": "Stale pending rows (>4h)",
+                "severity": "high", "count": int(stale_pending),
+                "breakdown": [], "samples": [dict(r) for r in sp_samples],
+                "fix_action": "redrive",
+                "description": f"{stale_pending} rows stuck in 'pending' for more than 4 hours",
+            })
+
+        # ── RPT-009: High retry count (tries > 3) ────────────────────────────
+        high_tries = q(conn,
+            f"SELECT COUNT(*) AS cnt FROM mws.report {base_where} AND tries > 3", ap)[0]["cnt"]
+        if high_tries:
+            ht_samples = q(conn,
+                f"SELECT request_id, report_type, status, tries, requested_date, account "
+                f"FROM mws.report {base_where} AND tries > 3 ORDER BY tries DESC LIMIT 5", ap)
+            issues.append({
+                "id": "RPT-009", "title": "High retry count (tries > 3)",
+                "severity": "medium", "count": int(high_tries),
+                "breakdown": [], "samples": [dict(r) for r in ht_samples],
+                "fix_action": "redrive",
+                "description": f"{high_tries} reports retried more than 3 times",
+            })
+
+        # ── RPT-010: Period date anomalies ────────────────────────────────────
+        date_anom = q(conn,
+            f"SELECT COUNT(*) AS cnt FROM mws.report {base_where} "
+            f"AND period_end_date IS NOT NULL AND period_start_date IS NOT NULL "
+            f"AND period_end_date < period_start_date", ap)[0]["cnt"]
+        if date_anom:
+            da_samples = q(conn,
+                f"SELECT request_id, report_type, period_start_date, period_end_date, account "
+                f"FROM mws.report {base_where} AND period_end_date < period_start_date LIMIT 5", ap)
+            issues.append({
+                "id": "RPT-010", "title": "Period date anomaly (end < start)",
+                "severity": "medium", "count": int(date_anom),
+                "breakdown": [], "samples": [dict(r) for r in da_samples],
+                "fix_action": None,
+                "description": f"{date_anom} rows where period_end_date is before period_start_date",
+            })
+
         conn.close()
-        import datetime
         return {
             "table":       "mws.report",
             "total_rows":  int(total),
