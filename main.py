@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Query
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-import psycopg2, psycopg2.extras, os, httpx, json, asyncio
+import psycopg2, psycopg2.extras, os, httpx, json, asyncio, threading, datetime, uuid
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -686,6 +686,12 @@ async def remediation_notify(payload: dict):
 # ── Flow Builder — Save / Load / Schedule ─────────────────────────────────────
 # Flows stored in memory (replace with DB in production)
 _SAVED_FLOWS = {}
+
+# ── Custom Workflow Store ─────────────────────────────────────────────────────
+# In-memory: { workflow_id -> workflow_dict }
+_CUSTOM_WORKFLOWS: dict = {}
+# Run history: last 50 runs across all custom workflows
+_wf_run_history: list = []
 
 class FlowSaveRequest(BaseModel):
     flow_id:     str
@@ -1831,3 +1837,334 @@ def wizi_agent_status(token: str):
     return {"token":    token,
             "decision": entry.get("decision"),
             "resolved": entry.get("decision") is not None}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CUSTOM WORKFLOW SCHEDULER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _cron_is_due(cron_expr: str, last_run_iso: str | None) -> bool:
+    """
+    Simple cron check: parse 'HH:MM' or '0 11 * * *' style.
+    Returns True if the workflow should fire now (within a 10-min window,
+    and hasn't already run in the past 50 minutes).
+    """
+    now = datetime.datetime.utcnow()
+    # If ran recently, skip
+    if last_run_iso:
+        try:
+            last = datetime.datetime.fromisoformat(last_run_iso)
+            if (now - last).total_seconds() < 50 * 60:
+                return False
+        except Exception:
+            pass
+
+    # Support "HH:MM IST" style (subtract 5:30 to convert to UTC)
+    try:
+        parts = cron_expr.strip().split()
+        if len(parts) == 5:
+            # standard cron: minute hour * * *
+            minute = int(parts[0])
+            hour   = int(parts[1])
+        else:
+            # "4:30 PM IST" style
+            time_str = parts[0] if len(parts) >= 1 else cron_expr
+            ampm = parts[1].upper() if len(parts) > 1 else ""
+            h, m = map(int, time_str.replace("PM","").replace("AM","").strip().split(":"))
+            if "PM" in ampm and h != 12:
+                h += 12
+            # Convert IST (UTC+5:30) to UTC
+            total_min = h * 60 + m - 330
+            if total_min < 0:
+                total_min += 1440
+            hour   = total_min // 60
+            minute = total_min % 60
+
+        # Fire if within 10-minute window
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        diff   = abs((now - target).total_seconds())
+        return diff <= 600  # 10-min window
+    except Exception:
+        return False
+
+
+async def _run_custom_workflow(wf: dict, triggered_by: str = "manual") -> dict:
+    """
+    Execute a custom workflow:
+    1. Loop through wf["tables"], run Table Agent on each
+    2. Apply branching rules after each agent result
+    3. Consolidate issues, return summary
+    """
+    run_id    = f"cwf_{uuid.uuid4().hex[:8]}"
+    started   = datetime.datetime.utcnow().isoformat()
+    tables    = wf.get("tables", [])
+    branches  = wf.get("branches", [])
+    agents    = wf.get("agents", [])
+    results   = []
+    all_issues = []
+    stopped   = False
+    skip_rest = False
+    slack_url = os.getenv("SLACK_WEBHOOK_URL", "")
+
+    for i, table_str in enumerate(tables):
+        if stopped or skip_rest:
+            results.append({"table": table_str, "skipped": True,
+                            "reason": "stopped" if stopped else "skip_remaining"})
+            continue
+
+        # Parse schema.table
+        parts  = table_str.split(".", 1)
+        schema = parts[0] if len(parts) == 2 else "mws"
+        table  = parts[1] if len(parts) == 2 else parts[0]
+
+        agent_name = agents[i] if i < len(agents) else f"Agent{i+1}"
+
+        try:
+            if LANGGRAPH_AVAILABLE:
+                from langchain_openai import ChatOpenAI  # already imported in module
+                init: dict = {
+                    "schema": schema, "table": table, "account": None,
+                    "threshold": 50, "total_rows": 0, "alerts": [],
+                    "classification": None, "fix_results": [], "verify_alerts": [],
+                    "notified": False, "trace": [], "status": "running", "error": None,
+                }
+                graph  = get_table_agent_graph()
+                result = await asyncio.to_thread(graph.invoke, init)
+                issues = result.get("alerts", [])
+                status = result.get("status", "done")
+                trace  = result.get("trace", [])
+            else:
+                # Fallback: raw SQL checks without LangGraph
+                conn   = get_connection()
+                issues = []
+                trace  = []
+                try:
+                    rows = q(conn, f"SELECT COUNT(*) AS cnt FROM {schema}.{table}")
+                    total = rows[0]["cnt"] if rows else 0
+                    trace.append({"node": "count", "msg": f"{total} rows in {table_str}"})
+
+                    # NULL check on first varchar column
+                    col_rows = q(conn, """
+                        SELECT column_name FROM information_schema.columns
+                        WHERE table_schema=%s AND table_name=%s
+                        AND data_type IN ('character varying','varchar','text')
+                        LIMIT 1
+                    """, [schema, table])
+                    if col_rows:
+                        col = col_rows[0]["column_name"]
+                        null_rows = q(conn, f"SELECT COUNT(*) AS cnt FROM {schema}.{table} WHERE {col} IS NULL")
+                        null_cnt = null_rows[0]["cnt"] if null_rows else 0
+                        if null_cnt > 0:
+                            issues.append({"type": "null", "column": col, "count": null_cnt,
+                                           "severity": "high" if null_cnt > 10 else "medium"})
+
+                    # Freshness check
+                    date_cols = q(conn, """
+                        SELECT column_name FROM information_schema.columns
+                        WHERE table_schema=%s AND table_name=%s
+                        AND data_type IN ('date','timestamp','timestamp without time zone',
+                                          'timestamp with time zone')
+                        LIMIT 1
+                    """, [schema, table])
+                    if date_cols:
+                        dc = date_cols[0]["column_name"]
+                        fresh = q(conn, f"SELECT MAX({dc})::text AS latest FROM {schema}.{table}")
+                        latest = fresh[0]["latest"] if fresh else None
+                        trace.append({"node": "freshness", "msg": f"latest {dc}: {latest}"})
+                        if latest:
+                            try:
+                                lat_dt = datetime.datetime.fromisoformat(str(latest)[:19])
+                                age_h  = (datetime.datetime.utcnow() - lat_dt).total_seconds() / 3600
+                                if age_h > 26:
+                                    issues.append({"type": "freshness", "column": dc,
+                                                   "age_hours": round(age_h, 1),
+                                                   "severity": "critical" if age_h > 48 else "high"})
+                            except Exception:
+                                pass
+                    conn.close()
+                    status = "done"
+                except Exception as ex:
+                    status = "error"
+                    issues.append({"type": "error", "msg": str(ex), "severity": "high"})
+                    try: conn.close()
+                    except Exception: pass
+
+        except Exception as e:
+            issues = [{"type": "error", "msg": str(e), "severity": "high"}]
+            status = "error"
+            trace  = []
+
+        step_result = {
+            "table": table_str, "agent": agent_name,
+            "status": status, "issues": issues, "trace": trace,
+        }
+        results.append(step_result)
+        all_issues.extend(issues)
+
+        # ── Apply branching rules ─────────────────────────────────────────
+        for branch in branches:
+            after = branch.get("afterAgent", "")
+            if after and after != agent_name:
+                continue  # rule not for this agent
+            cond   = branch.get("condition", "always")
+            action = branch.get("action", "notify")
+            fired  = (
+                cond == "always" or
+                (cond == "on_failure" and (status == "error" or len(issues) > 0)) or
+                (cond == "on_success" and status == "done" and len(issues) == 0)
+            )
+            if not fired:
+                continue
+
+            if action == "stop":
+                stopped = True
+                step_result["branch_action"] = "stopped"
+                break
+            elif action == "skip_remaining":
+                skip_rest = True
+                step_result["branch_action"] = "skip_remaining"
+                break
+            elif action == "notify":
+                step_result["branch_action"] = "notified"
+                if slack_url and issues:
+                    try:
+                        msg = (f"⚠️ *{wf['name']}* — `{table_str}` ({agent_name})\n"
+                               f"{len(issues)} issue(s): "
+                               + ", ".join(set(iss.get('type','?') for iss in issues)))
+                        httpx.post(slack_url, json={"text": msg}, timeout=5)
+                    except Exception:
+                        pass
+            elif action == "run_agent":
+                step_result["branch_action"] = f"run_agent:{branch.get('target','')}"
+
+    # ── Final Slack summary ───────────────────────────────────────────────────
+    total_issues = len(all_issues)
+    run_status   = "issues_found" if total_issues > 0 else "clean"
+    if slack_url and total_issues > 0:
+        try:
+            lines = [f"📋 *{wf['name']}* run complete — {total_issues} issue(s) across {len(tables)} table(s)"]
+            for r in results:
+                if r.get("issues"):
+                    lines.append(f"  • `{r['table']}`: {len(r['issues'])} issue(s)")
+            httpx.post(slack_url, json={"text": "\n".join(lines)}, timeout=5)
+        except Exception:
+            pass
+
+    run_record = {
+        "run_id":       run_id,
+        "workflow_id":  wf.get("id", ""),
+        "workflow_name": wf.get("name", ""),
+        "triggered_by": triggered_by,
+        "started_at":   started,
+        "finished_at":  datetime.datetime.utcnow().isoformat(),
+        "status":       run_status,
+        "total_issues": total_issues,
+        "table_results": results,
+    }
+
+    # Append to history, cap at 50
+    _wf_run_history.append(run_record)
+    if len(_wf_run_history) > 50:
+        _wf_run_history.pop(0)
+
+    # Update last_run on the stored workflow
+    if wf.get("id") and wf["id"] in _CUSTOM_WORKFLOWS:
+        _CUSTOM_WORKFLOWS[wf["id"]]["last_run"] = started
+        _CUSTOM_WORKFLOWS[wf["id"]]["run_count"] = \
+            _CUSTOM_WORKFLOWS[wf["id"]].get("run_count", 0) + 1
+
+    return run_record
+
+
+# ── API Endpoints ─────────────────────────────────────────────────────────────
+
+@app.post("/api/custom-workflows/save")
+async def save_custom_workflow(payload: dict = {}):
+    """
+    Save or update a custom workflow.
+    Body: { id?, name, desc, trigger, schedule, agents, tables, branches, endpoint? }
+    """
+    wf_id = payload.get("id") or uuid.uuid4().hex[:12]
+    now   = datetime.datetime.utcnow().isoformat()
+    existing = _CUSTOM_WORKFLOWS.get(wf_id, {})
+    _CUSTOM_WORKFLOWS[wf_id] = {
+        **existing,
+        "id":          wf_id,
+        "name":        payload.get("name", "Unnamed Workflow"),
+        "desc":        payload.get("desc", ""),
+        "trigger":     payload.get("trigger", "manual"),
+        "schedule":    payload.get("schedule", ""),
+        "agents":      payload.get("agents", []),
+        "tables":      payload.get("tables", []),
+        "branches":    payload.get("branches", []),
+        "endpoint":    payload.get("endpoint", ""),
+        "saved_at":    existing.get("saved_at", now),
+        "updated_at":  now,
+        "last_run":    existing.get("last_run"),
+        "run_count":   existing.get("run_count", 0),
+    }
+    return {"saved": True, "id": wf_id, "workflow": _CUSTOM_WORKFLOWS[wf_id]}
+
+
+@app.get("/api/custom-workflows")
+def list_custom_workflows():
+    """List all saved custom workflows."""
+    return list(_CUSTOM_WORKFLOWS.values())
+
+
+@app.delete("/api/custom-workflows/{wf_id}")
+def delete_custom_workflow(wf_id: str):
+    """Delete a custom workflow by ID."""
+    if wf_id not in _CUSTOM_WORKFLOWS:
+        return {"error": "Not found"}
+    del _CUSTOM_WORKFLOWS[wf_id]
+    return {"deleted": True, "id": wf_id}
+
+
+@app.post("/api/custom-workflows/{wf_id}/run")
+async def run_custom_workflow(wf_id: str):
+    """
+    Manually trigger a saved custom workflow.
+    Returns full run record with per-table results.
+    """
+    if wf_id not in _CUSTOM_WORKFLOWS:
+        return {"error": f"Workflow '{wf_id}' not found"}
+    wf = _CUSTOM_WORKFLOWS[wf_id]
+    if not wf.get("tables"):
+        return {"error": "Workflow has no tables configured"}
+    result = await _run_custom_workflow(wf, triggered_by="manual")
+    return result
+
+
+@app.get("/api/custom-workflows/history")
+def custom_workflow_history():
+    """Return last 50 custom workflow run records."""
+    return list(reversed(_wf_run_history))
+
+
+@app.post("/api/custom-workflows/cron-check")
+async def custom_workflow_cron_check():
+    """
+    Called by Railway cron every 10 minutes: 
+        */10 * * * *
+    Checks all scheduled custom workflows and fires any that are due.
+    Returns list of triggered workflow IDs.
+    """
+    triggered = []
+    for wf_id, wf in _CUSTOM_WORKFLOWS.items():
+        if wf.get("trigger") != "scheduled":
+            continue
+        schedule = wf.get("schedule", "").strip()
+        if not schedule:
+            continue
+        if _cron_is_due(schedule, wf.get("last_run")):
+            try:
+                result = await _run_custom_workflow(wf, triggered_by="cron")
+                triggered.append({"id": wf_id, "name": wf["name"],
+                                   "run_id": result["run_id"], "status": result["status"]})
+            except Exception as e:
+                triggered.append({"id": wf_id, "name": wf["name"], "error": str(e)})
+    return {"checked_at": datetime.datetime.utcnow().isoformat(),
+            "triggered": triggered, "count": len(triggered)}
