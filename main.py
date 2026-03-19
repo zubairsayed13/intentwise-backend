@@ -119,6 +119,88 @@ def preview_table(schema: str = Query(...), table: str = Query(...), limit: int 
         return {"error": str(e)}
 
 # ── Custom SQL ────────────────────────────────────────────────────────────────
+@app.post("/api/monitor/run-checks")
+async def run_monitor_checks(payload: dict = {}):
+    """
+    Run a check set: multiple named SQL queries on a table.
+    Body: {
+      "checks": [
+        { "id": "c1", "name": "Downloads by report type",
+          "sql": "SELECT report_type, COUNT(*) AS cnt FROM mws.report ...",
+          "pass_condition": "rows > 0"   // optional: "rows > N", "value > N", "value = N"
+        }
+      ]
+    }
+    Returns: { results: [{ id, name, status, rows, columns, error, duration_ms }] }
+    """
+    checks = payload.get("checks", [])
+    results = []
+    for check in checks:
+        start_ms = __import__("time").time() * 1000
+        check_id = check.get("id", "")
+        name     = check.get("name", "")
+        sql      = check.get("sql", "").strip()
+        cond     = check.get("pass_condition", "rows > 0")
+
+        if not sql:
+            results.append({"id":check_id,"name":name,"status":"error",
+                            "error":"No SQL provided","rows":[],"columns":[],"duration_ms":0})
+            continue
+
+        # Safety: only allow SELECT / WITH
+        first_word = sql.split()[0].upper() if sql.split() else ""
+        if first_word not in ("SELECT","WITH"):
+            results.append({"id":check_id,"name":name,"status":"error",
+                            "error":"Only SELECT/WITH queries allowed","rows":[],"columns":[],"duration_ms":0})
+            continue
+
+        try:
+            conn = get_connection()
+            cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(sql)
+            rows    = cur.fetchmany(500)
+            columns = [desc[0] for desc in cur.description] if cur.description else []
+            cur.close(); conn.close()
+            row_dicts = [dict(r) for r in rows]
+
+            # Evaluate pass condition
+            passed = True
+            try:
+                row_count = len(row_dicts)
+                # "rows > N"
+                if cond.startswith("rows"):
+                    op, val = cond.split()[1], int(cond.split()[2])
+                    passed = eval(f"{row_count} {op} {val}")
+                # "value > N" — uses first numeric cell of first row
+                elif cond.startswith("value") and row_dicts:
+                    first_val = list(row_dicts[0].values())[0]
+                    op, val = cond.split()[1], float(cond.split()[2])
+                    passed = eval(f"{float(first_val or 0)} {op} {val}")
+            except Exception:
+                passed = len(row_dicts) > 0
+
+            duration_ms = round((__import__("time").time() * 1000) - start_ms)
+            results.append({
+                "id":        check_id,
+                "name":      name,
+                "status":    "pass" if passed else "fail",
+                "rows":      row_dicts,
+                "columns":   columns,
+                "row_count": len(row_dicts),
+                "duration_ms": duration_ms,
+                "error":     None,
+            })
+        except Exception as e:
+            duration_ms = round((__import__("time").time() * 1000) - start_ms)
+            results.append({"id":check_id,"name":name,"status":"error",
+                            "error":str(e).split("\n")[0],"rows":[],"columns":[],
+                            "duration_ms":duration_ms})
+
+    overall = "pass" if all(r["status"]=="pass" for r in results) else               "error" if any(r["status"]=="error" for r in results) else "fail"
+    return {"overall": overall, "results": results,
+            "ran_at": datetime.datetime.utcnow().isoformat()}
+
+
 @app.get("/api/query")
 def run_query(sql: str = Query(...)):
     try:
