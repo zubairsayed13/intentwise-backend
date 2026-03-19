@@ -2786,3 +2786,491 @@ async def slack_slash_command(request):
             "  `/wizi help`            \u2014 Show this message",
         ]
         return reply("\n".join(help_lines), ephemeral=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ADS DOWNLOAD SOP WORKFLOW
+# Flow: detection → gate1 → pause_mage → gate2 → validation →
+#       gate3 → refresh → gate4 → resume_copy → gate5 → finalize
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import pytz
+
+# ── Config ────────────────────────────────────────────────────────────────────
+SOP_TRIGGER_TIME_IST = os.getenv("SOP_TRIGGER_TIME", "16:00")   # 4:00 PM IST default
+SOP_GATE_TIMEOUT_MIN = int(os.getenv("SOP_GATE_TIMEOUT_MIN", "30"))
+
+# ── In-memory SOP state ───────────────────────────────────────────────────────
+_sop_runs: dict = {}          # { run_id: sop_state_dict }
+_sop_gate_store: dict = {}    # { token: { decision, event, gate_num, run_id } }
+_sop_today_run: str = None    # run_id of today's auto-triggered run
+
+MAGE_PACKAGES = [
+    { "id":"bw_campaign",   "org":"Bluewheel",  "name":"Campaign Summary",      "expected":"4:35 PM", "pause_by":"4:20 PM", "status":"running" },
+    { "id":"bw_adproduct",  "org":"Bluewheel",  "name":"Advertised Product",    "expected":"4:50 PM", "pause_by":"4:20 PM", "status":"running" },
+    { "id":"bw_prodsummary","org":"Bluewheel",  "name":"Product Summary",       "expected":"6:30 PM", "pause_by":"4:45 PM", "status":"running" },
+    { "id":"mr_adproduct",  "org":"Maryruth",   "name":"Advertised Product",    "expected":"4:30 PM", "pause_by":"4:30 PM", "status":"running" },
+    { "id":"mr_campaign",   "org":"Maryruth",   "name":"Campaign Summary",      "expected":"4:30 PM", "pause_by":"4:30 PM", "status":"running" },
+]
+
+AWS_REFRESH_JOBS = [
+    { "id":"aws_1", "name":"Campaign Report Refresh",        "type":"scheduled_query", "region":"us-east-1" },
+    { "id":"aws_2", "name":"Advertised Product Refresh",     "type":"scheduled_query", "region":"us-east-1" },
+    { "id":"aws_3", "name":"Keyword Report Refresh",         "type":"scheduled_query", "region":"us-east-1" },
+    { "id":"aws_4", "name":"Targets Report Refresh",         "type":"scheduled_query", "region":"us-east-1" },
+    { "id":"aws_5", "name":"Product Summary Refresh",        "type":"aws_job",         "region":"us-east-1" },
+]
+
+GDS_COPY_JOBS = [
+    { "id":"gds_1", "name":"Advertised Product",  "destination":"BigQuery" },
+    { "id":"gds_2", "name":"Product Target",       "destination":"BigQuery" },
+    { "id":"gds_3", "name":"Product Summary",      "destination":"BigQuery" },
+    { "id":"gds_4", "name":"Account Summary",      "destination":"BigQuery" },
+    { "id":"gds_5", "name":"Campaign Summary",     "destination":"BigQuery" },
+    { "id":"gds_6", "name":"Keyword Summary",      "destination":"BigQuery" },
+]
+
+ADS_TABLES = [
+    "public.tbl_amzn_campaign_report",
+    "public.tbl_amzn_product_ad_report",
+    "public.tbl_amzn_keyword_report",
+    "public.tbl_amzn_targets_report",
+]
+
+def _ts():
+    return datetime.datetime.utcnow().strftime("%H:%M:%S")
+
+def _ist_now():
+    ist = pytz.timezone("Asia/Kolkata")
+    return datetime.datetime.now(ist)
+
+def _ist_past_time(time_str_ist: str) -> bool:
+    """Check if current IST time is past a given HH:MM string."""
+    try:
+        now = _ist_now()
+        h, m = map(int, time_str_ist.split(":"))
+        trigger = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        return now >= trigger
+    except Exception:
+        return False
+
+# ── SOP Step Implementations ──────────────────────────────────────────────────
+
+async def _sop_detection(run_id: str) -> dict:
+    """Check all 4 ads tables for n-1 data availability."""
+    trace = []
+    details = []
+    missing = False
+    n1_date = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+
+    try:
+        conn = get_connection()
+        for tbl in ADS_TABLES:
+            short = tbl.split("tbl_amzn_")[1].replace("_report","")
+            try:
+                r = q(conn, f"SELECT COUNT(*) AS cnt FROM {tbl} WHERE report_date = %s", [n1_date])
+                cnt = int(r[0]["cnt"]) if r else 0
+                if cnt == 0:
+                    details.append({"check":f"{short} ({n1_date})","status":"FAIL","detail":"No data for n-1 date"})
+                    missing = True
+                else:
+                    details.append({"check":f"{short} ({n1_date})","status":"PASS","detail":f"{cnt} rows"})
+            except Exception as e:
+                details.append({"check":short,"status":"WARN","detail":str(e)[:80]})
+        conn.close()
+    except Exception as e:
+        details.append({"check":"db_connection","status":"FAIL","detail":str(e)[:100]})
+        missing = True
+
+    trace.append({"node":"detection","ts":_ts(),
+        "msg":f"Detection complete — {'issues found' if missing else 'all ads tables have n-1 data'}",
+        "level":"warning" if missing else "success"})
+
+    return {
+        "detection_result": {"missing": missing, "details": details, "n1_date": n1_date},
+        "trace_append": trace
+    }
+
+
+async def _sop_validation() -> dict:
+    """Validate ads tables: account count for n-1 vs 5-day baseline."""
+    results = []
+    n1 = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+
+    for tbl in ADS_TABLES:
+        short = tbl.split("tbl_amzn_")[1].replace("_report","")
+        try:
+            conn = get_connection()
+            # n-1 account count
+            today_r = q(conn, f"SELECT COUNT(DISTINCT account_id) AS cnt FROM {tbl} WHERE report_date = %s", [n1])
+            today_cnt = int(today_r[0]["cnt"]) if today_r else 0
+
+            # 5-day baseline
+            baseline_r = q(conn, f"""
+                SELECT AVG(daily_cnt) AS avg_cnt FROM (
+                    SELECT report_date, COUNT(DISTINCT account_id) AS daily_cnt
+                    FROM {tbl}
+                    WHERE report_date BETWEEN %s AND %s
+                    GROUP BY report_date
+                ) d
+            """, [
+                (datetime.date.today() - datetime.timedelta(days=6)).isoformat(),
+                (datetime.date.today() - datetime.timedelta(days=2)).isoformat()
+            ])
+            baseline = float(baseline_r[0]["avg_cnt"] or 0) if baseline_r else 0
+
+            pct = (today_cnt / baseline * 100) if baseline > 0 else 0
+            passed = today_cnt > 0 and (baseline == 0 or pct >= 80)
+
+            results.append({
+                "name": tbl,
+                "short": short,
+                "status": "PASS" if passed else "FAIL",
+                "today_count": today_cnt,
+                "baseline_avg": round(baseline, 1),
+                "coverage_pct": round(pct, 1),
+                "has_today": today_cnt > 0,
+                "profile_count": today_cnt,
+                "recent_dates": [n1],
+            })
+            conn.close()
+        except Exception as e:
+            results.append({
+                "name": tbl, "short": short,
+                "status": "WARN",
+                "today_count": 0, "baseline_avg": 0, "coverage_pct": 0,
+                "has_today": False, "profile_count": 0, "recent_dates": [],
+                "error": str(e)[:80]
+            })
+
+    all_pass = all(r["status"] in ("PASS","WARN") for r in results)
+    return {
+        "validation_results": results,
+        "validation_pass": all_pass,
+        "trace_append": [{"node":"validation","ts":_ts(),
+            "msg":f"Validation {'passed' if all_pass else 'FAILED'} — {sum(1 for r in results if r['status']=='PASS')}/{len(results)} tables OK",
+            "level":"success" if all_pass else "warning"}]
+    }
+
+
+async def _sop_pause_mage() -> dict:
+    """Dummy Mage pause API — pauses all 5 packages. Replace URL later."""
+    results = []
+    for pkg in MAGE_PACKAGES:
+        # DUMMY — replace with: POST {MAGE_API_URL}/api/pipelines/{pkg_id}/pause
+        await asyncio.sleep(0.1)
+        results.append({**pkg, "paused": True, "paused_at": _ts(),
+                        "dummy": True, "note": "Replace with real Mage API"})
+    return {
+        "mage_checklist": results,
+        "trace_append": [{"node":"pause_mage","ts":_ts(),
+            "msg":f"Mage packages paused (dummy) — {len(results)} packages","level":"info"}]
+    }
+
+
+async def _sop_refresh() -> dict:
+    """Dummy AWS job triggers. Replace with real AWS API / console links later."""
+    results = []
+    for job in AWS_REFRESH_JOBS:
+        # DUMMY — replace with: boto3 / AWS API call / console URL
+        await asyncio.sleep(0.1)
+        results.append({**job, "triggered": True, "triggered_at": _ts(),
+                        "dummy": True, "note": "Replace with real AWS endpoint or IAM-authenticated URL"})
+    return {
+        "refresh_checklist": results,
+        "trace_append": [{"node":"refresh","ts":_ts(),
+            "msg":f"Refresh jobs triggered (dummy) — {len(results)} jobs","level":"info"}]
+    }
+
+
+async def _sop_resume_copy() -> dict:
+    """Dummy GDS BigQuery copy triggers via Mage. Replace with real Mage pipeline IDs later."""
+    results = []
+    for job in GDS_COPY_JOBS:
+        # DUMMY — replace with: POST {MAGE_API_URL}/api/pipelines/{pipeline_id}/pipeline_runs
+        await asyncio.sleep(0.1)
+        results.append({**job, "triggered": True, "triggered_at": _ts(),
+                        "dummy": True, "note": "Replace with real Mage pipeline ID"})
+    return {
+        "copy_checklist": results,
+        "trace_append": [{"node":"resume_copy","ts":_ts(),
+            "msg":f"GDS copy jobs triggered (dummy) — {len(results)} copies","level":"info"}]
+    }
+
+
+async def _sop_finalize(run_state: dict) -> dict:
+    """Generate summary and send Slack notification."""
+    validation  = run_state.get("validation_results", [])
+    pass_count  = sum(1 for r in validation if r.get("status")=="PASS")
+    gates_done  = sum(1 for i in range(1,6) if run_state.get(f"gate{i}_decision")=="approved")
+    duration    = ""
+    if run_state.get("started_at"):
+        try:
+            start = datetime.datetime.fromisoformat(run_state["started_at"][:19])
+            mins  = round((datetime.datetime.utcnow() - start).total_seconds() / 60)
+            duration = f" · Duration: {mins}m"
+        except Exception: pass
+
+    summary = (
+        f"Ads Download SOP Complete{duration}\n"
+        f"Gates approved: {gates_done}/5\n"
+        f"Validation: {pass_count}/{len(validation)} tables passed\n"
+        f"Mage packages paused + resumed: {len(MAGE_PACKAGES)}\n"
+        f"Refresh jobs triggered: {len(AWS_REFRESH_JOBS)}\n"
+        f"GDS copies triggered: {len(GDS_COPY_JOBS)}"
+    )
+
+    notified = False
+    slack_url = os.getenv("SLACK_WEBHOOK_URL","")
+    if slack_url:
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                await client.post(slack_url, json={"text": f"\u2705 *{summary}*"})
+            notified = True
+        except Exception: pass
+
+    return {
+        "completion_summary": summary,
+        "notified": notified,
+        "status": "complete",
+        "trace_append": [{"node":"finalize","ts":_ts(),"msg":"SOP complete","level":"success"}]
+    }
+
+
+def _make_gate_token(run_id: str, gate_num: int) -> str:
+    return f"sop-{run_id}-g{gate_num}"
+
+
+async def _gate_await(run_id: str, gate_num: int, timeout_min: int = None) -> str:
+    """Block until gate decision arrives or timeout. Returns 'approved'|'rejected'|'timeout'."""
+    if timeout_min is None:
+        timeout_min = SOP_GATE_TIMEOUT_MIN
+    token = _make_gate_token(run_id, gate_num)
+    evt   = threading.Event()
+    _sop_gate_store[token] = {"decision": None, "event": evt, "gate_num": gate_num,
+                               "run_id": run_id, "created_at": datetime.datetime.utcnow().isoformat()}
+    # Update run state with token
+    if run_id in _sop_runs:
+        _sop_runs[run_id][f"gate{gate_num}_token"]    = token
+        _sop_runs[run_id][f"gate{gate_num}_decision"] = "pending"
+    fired = await asyncio.to_thread(evt.wait, timeout_min * 60)
+    if not fired:
+        if run_id in _sop_runs:
+            _sop_runs[run_id][f"gate{gate_num}_decision"] = "timeout"
+        return "timeout"
+    decision = _sop_gate_store[token].get("decision", "rejected")
+    if run_id in _sop_runs:
+        _sop_runs[run_id][f"gate{gate_num}_decision"] = decision
+    return decision
+
+
+async def _run_sop(run_id: str, gate_timeout_min: int = None):
+    """Execute the full SOP workflow asynchronously."""
+    global _sop_today_run
+    state = _sop_runs[run_id]
+    trace = state["trace"]
+
+    def append_trace(entries):
+        for e in entries:
+            trace.append(e)
+
+    def update(d):
+        state.update(d)
+        if "trace_append" in d:
+            append_trace(d.pop("trace_append"))
+
+    try:
+        # ── Detection ─────────────────────────────────────────────────────────
+        state["status"] = "detection"
+        update(await _sop_detection(run_id))
+        if not state["detection_result"]["missing"]:
+            state["status"] = "complete_no_issues"
+            state["completion_summary"] = "Detection passed — data available, SOP not required."
+            return
+
+        # ── Gate 1: Pause Mage Jobs ────────────────────────────────────────────
+        state["status"] = "awaiting_gate1"
+        trace.append({"node":"gate1","ts":_ts(),"msg":"Awaiting Gate 1: Pause Mage Jobs","level":"warning"})
+        dec = await _gate_await(run_id, 1, gate_timeout_min)
+        if dec == "rejected":
+            state["status"] = "stopped"; return
+        if dec == "timeout":
+            trace.append({"node":"gate1","ts":_ts(),"msg":"Gate 1 timed out — force proceeding","level":"warning"})
+
+        # ── Pause Mage ────────────────────────────────────────────────────────
+        state["status"] = "pause_mage"
+        update(await _sop_pause_mage())
+
+        # ── Gate 2: Data Available ─────────────────────────────────────────────
+        state["status"] = "awaiting_gate2"
+        trace.append({"node":"gate2","ts":_ts(),"msg":"Awaiting Gate 2: Data Available","level":"warning"})
+        dec = await _gate_await(run_id, 2, gate_timeout_min)
+        if dec == "rejected":
+            state["status"] = "stopped"; return
+
+        # ── Validation ────────────────────────────────────────────────────────
+        state["status"] = "validation"
+        update(await _sop_validation())
+
+        # ── Gate 3: Proceed with Refreshes ────────────────────────────────────
+        state["status"] = "awaiting_gate3"
+        trace.append({"node":"gate3","ts":_ts(),"msg":"Awaiting Gate 3: Proceed with Refreshes","level":"warning"})
+        dec = await _gate_await(run_id, 3, gate_timeout_min)
+        if dec == "rejected":
+            state["status"] = "stopped"; return
+
+        # ── Refresh ───────────────────────────────────────────────────────────
+        state["status"] = "refresh"
+        update(await _sop_refresh())
+
+        # ── Gate 4: Run Product Summary ───────────────────────────────────────
+        state["status"] = "awaiting_gate4"
+        trace.append({"node":"gate4","ts":_ts(),"msg":"Awaiting Gate 4: Run Product Summary","level":"warning"})
+        dec = await _gate_await(run_id, 4, gate_timeout_min)
+        if dec == "rejected":
+            state["status"] = "stopped"; return
+
+        # ── Resume Copy ───────────────────────────────────────────────────────
+        state["status"] = "resume_copy"
+        update(await _sop_resume_copy())
+
+        # ── Gate 5: Resume Mage & GDS Copies ──────────────────────────────────
+        state["status"] = "awaiting_gate5"
+        trace.append({"node":"gate5","ts":_ts(),"msg":"Awaiting Gate 5: Resume Mage & GDS Copies","level":"warning"})
+        dec = await _gate_await(run_id, 5, gate_timeout_min)
+        if dec == "rejected":
+            state["status"] = "stopped"; return
+
+        # ── Finalize ──────────────────────────────────────────────────────────
+        state["status"] = "finalizing"
+        update(await _sop_finalize(state))
+
+    except Exception as e:
+        state["status"] = "error"
+        state["error"]  = str(e)
+        trace.append({"node":"error","ts":_ts(),"msg":str(e),"level":"error"})
+
+    _sop_today_run = run_id
+
+
+# ── API Endpoints ─────────────────────────────────────────────────────────────
+
+@app.post("/api/workflow/ads-sop")
+async def start_ads_sop(payload: dict = {}):
+    """
+    Start the Ads Download SOP workflow.
+    Body: { "gate_timeout_min": 30 }  — optional timeout override
+    Returns run_id immediately; poll /api/workflow/ads-sop/{run_id} for state.
+    """
+    run_id  = f"sop_{uuid.uuid4().hex[:8]}"
+    timeout = payload.get("gate_timeout_min", SOP_GATE_TIMEOUT_MIN)
+
+    _sop_runs[run_id] = {
+        "run_id": run_id, "status": "starting",
+        "started_at": datetime.datetime.utcnow().isoformat(),
+        "trace": [{"node":"sop","ts":_ts(),"msg":"SOP started","level":"info"}],
+        "detection_result": None,
+        "validation_results": [], "validation_pass": None,
+        "mage_checklist": [], "refresh_checklist": [], "copy_checklist": [],
+        "completion_summary": None, "notified": False, "error": None,
+        **{f"gate{i}_token": None for i in range(1,6)},
+        **{f"gate{i}_decision": None for i in range(1,6)},
+    }
+
+    # Run asynchronously — don't await (long-running)
+    asyncio.create_task(_run_sop(run_id, timeout))
+
+    return {"run_id": run_id, "status": "starting",
+            "poll_url": f"/api/workflow/ads-sop/{run_id}"}
+
+
+@app.get("/api/workflow/ads-sop/{run_id}")
+def get_sop_run(run_id: str):
+    """Poll SOP run state."""
+    state = _sop_runs.get(run_id)
+    if not state:
+        return {"error": f"Run {run_id} not found"}
+    return state
+
+
+@app.get("/api/workflow/ads-sop")
+def get_latest_sop():
+    """Return the most recent SOP run, or null."""
+    if not _sop_runs:
+        return {"run": None}
+    latest = sorted(_sop_runs.values(), key=lambda r: r.get("started_at",""), reverse=True)[0]
+    return {"run": latest}
+
+
+@app.post("/api/workflow/sop-gate")
+async def submit_sop_gate(payload: dict = {}):
+    """
+    Submit a gate decision.
+    Body: { "token": "sop-xxx-g1", "decision": "approve" | "reject" | "force" }
+    force = approve immediately regardless of timeout.
+    """
+    token    = payload.get("token","")
+    decision = payload.get("decision","reject")
+    if decision == "force":
+        decision = "approved"
+
+    entry = _sop_gate_store.get(token)
+    if not entry:
+        return {"error": f"Token {token} not found"}
+    if entry.get("decision") is not None:
+        return {"error": "Gate already resolved", "decision": entry["decision"]}
+
+    entry["decision"] = decision
+    entry["event"].set()
+
+    run_id = entry.get("run_id","")
+    if run_id in _sop_runs:
+        gate_num = entry.get("gate_num",0)
+        _sop_runs[run_id][f"gate{gate_num}_decision"] = decision
+
+    return {"token": token, "decision": decision, "accepted": True}
+
+
+@app.post("/api/workflow/sop-gate-force")
+async def force_sop_gate(payload: dict = {}):
+    """Force-proceed all pending gates for a run (for testing/override)."""
+    run_id = payload.get("run_id","")
+    if not run_id or run_id not in _sop_runs:
+        return {"error": "run_id not found"}
+    forced = []
+    for token, entry in _sop_gate_store.items():
+        if entry.get("run_id") == run_id and entry.get("decision") is None:
+            entry["decision"] = "approved"
+            entry["event"].set()
+            _sop_runs[run_id][f"gate{entry['gate_num']}_decision"] = "approved"
+            forced.append(token)
+    return {"forced": forced, "count": len(forced)}
+
+
+@app.post("/api/workflow/sop-auto-trigger")
+async def sop_auto_trigger(payload: dict = {}):
+    """
+    Called by cron. Auto-triggers SOP if:
+    1. Current IST time is past SOP_TRIGGER_TIME (default 4:00 PM)
+    2. No SOP has run today already
+    """
+    global _sop_today_run
+    trigger_time = payload.get("trigger_time", SOP_TRIGGER_TIME_IST)
+    ist_today    = _ist_now().date().isoformat()
+
+    # Check if already ran today
+    if _sop_today_run and _sop_today_run in _sop_runs:
+        run = _sop_runs[_sop_today_run]
+        if run.get("started_at","")[:10] == ist_today:
+            return {"triggered": False, "reason": "SOP already ran today",
+                    "run_id": _sop_today_run}
+
+    if not _ist_past_time(trigger_time):
+        return {"triggered": False,
+                "reason": f"Not yet {trigger_time} IST — current: {_ist_now().strftime('%H:%M')}"}
+
+    # Auto-trigger
+    result = await start_ads_sop({"gate_timeout_min": SOP_GATE_TIMEOUT_MIN})
+    _sop_today_run = result["run_id"]
+    return {"triggered": True, "run_id": result["run_id"],
+            "reason": f"Auto-triggered at {_ist_now().strftime('%H:%M')} IST"}
