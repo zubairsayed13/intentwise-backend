@@ -1171,6 +1171,14 @@ try:
     from langchain_openai import ChatOpenAI
     from langchain_core.messages import HumanMessage, SystemMessage
 
+    # ── LangSmith tracing ─────────────────────────────────────────────────────
+    # Set LANGCHAIN_API_KEY + LANGCHAIN_TRACING_V2=true in Railway env vars.
+    # No code changes needed — LangChain auto-instruments all LangGraph runs.
+    import os as _os
+    if _os.getenv("LANGCHAIN_API_KEY") and _os.getenv("LANGCHAIN_TRACING_V2","").lower() == "true":
+        import langsmith  # noqa — import triggers SDK init
+        _os.environ.setdefault("LANGCHAIN_PROJECT", "intentwise-wizi")
+
     LANGGRAPH_AVAILABLE = True
 except ImportError:
     LANGGRAPH_AVAILABLE = False
@@ -2323,3 +2331,376 @@ async def custom_workflow_cron_check():
                 triggered.append({"id": wf_id, "name": wf["name"], "error": str(e)})
     return {"checked_at": datetime.datetime.utcnow().isoformat(),
             "triggered": triggered, "count": len(triggered)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ANOMALY DETECTION — STATISTICAL BASELINES
+# Learns normal row counts, NULL rates, value distributions per table per weekday.
+# Stores baselines in a lightweight in-memory dict (per Railway process lifetime).
+# For persistence, set BASELINE_TABLE=wz_baselines and it will use Redshift.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_baselines: dict = {}   # { "schema.table": { "row_count": {...}, "null_rates": {...} } }
+
+def _baseline_key(schema: str, table: str) -> str:
+    return f"{schema}.{table}"
+
+def _build_baseline(schema: str, table: str) -> dict:
+    """
+    Compute baseline stats for a table:
+    - row_count: total rows right now
+    - null_rates: fraction of NULLs per column
+    - numeric_stats: mean/stddev for numeric columns
+    Stored with today's weekday so we can compare like-for-like (Mon vs Mon).
+    """
+    conn = get_connection()
+    baseline = {"schema": schema, "table": table,
+                "computed_at": datetime.datetime.utcnow().isoformat(),
+                "weekday": datetime.datetime.utcnow().weekday(),
+                "row_count": 0, "null_rates": {}, "numeric_stats": {}}
+    try:
+        total = q(conn, f"SELECT COUNT(*) AS cnt FROM {schema}.{table}")[0]["cnt"]
+        baseline["row_count"] = int(total)
+
+        cols = q(conn,
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_schema=%s AND table_name=%s ORDER BY ordinal_position",
+            [schema, table])
+
+        for c in cols:
+            col, dtype = c["column_name"], c["data_type"]
+            null_cnt = q(conn, f"SELECT COUNT(*) AS cnt FROM {schema}.{table} WHERE {col} IS NULL")[0]["cnt"]
+            baseline["null_rates"][col] = round(int(null_cnt) / max(total, 1), 4)
+            if dtype in ("integer","bigint","numeric","double precision","real","float","decimal"):
+                stats = q(conn,
+                    f"SELECT AVG({col}::float) AS mean, STDDEV({col}::float) AS stddev FROM {schema}.{table}")
+                if stats:
+                    baseline["numeric_stats"][col] = {
+                        "mean":   round(float(stats[0]["mean"] or 0), 4),
+                        "stddev": round(float(stats[0]["stddev"] or 0), 4),
+                    }
+        conn.close()
+    except Exception as e:
+        baseline["error"] = str(e)
+        try: conn.close()
+        except: pass
+    return baseline
+
+
+def _check_anomalies(schema: str, table: str, baseline: dict) -> list:
+    """
+    Compare current table stats to stored baseline.
+    Returns list of anomaly dicts { column, type, baseline_value, current_value, deviation_pct, severity }
+    """
+    anomalies = []
+    conn = get_connection()
+    try:
+        total = q(conn, f"SELECT COUNT(*) AS cnt FROM {schema}.{table}")[0]["cnt"]
+        total = int(total)
+        base_rows = baseline.get("row_count", total)
+
+        # Row count deviation (>20% change = anomaly)
+        if base_rows > 0:
+            pct = abs(total - base_rows) / base_rows * 100
+            if pct > 20:
+                anomalies.append({
+                    "column": "_row_count",
+                    "type": "row_count_spike" if total > base_rows else "row_count_drop",
+                    "baseline_value": base_rows,
+                    "current_value": total,
+                    "deviation_pct": round(pct, 1),
+                    "severity": "critical" if pct > 50 else "high",
+                })
+
+        # NULL rate changes (>10pp increase = anomaly)
+        base_nulls = baseline.get("null_rates", {})
+        cols = q(conn,
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema=%s AND table_name=%s ORDER BY ordinal_position",
+            [schema, table])
+        for c in cols:
+            col = c["column_name"]
+            if col not in base_nulls:
+                continue
+            null_cnt = q(conn, f"SELECT COUNT(*) AS cnt FROM {schema}.{table} WHERE {col} IS NULL")[0]["cnt"]
+            cur_rate = int(null_cnt) / max(total, 1)
+            base_rate = base_nulls[col]
+            diff = cur_rate - base_rate
+            if diff > 0.10:  # >10 percentage point increase in NULLs
+                anomalies.append({
+                    "column": col,
+                    "type": "null_rate_increase",
+                    "baseline_value": round(base_rate * 100, 1),
+                    "current_value": round(cur_rate * 100, 1),
+                    "deviation_pct": round(diff * 100, 1),
+                    "severity": "high" if diff > 0.25 else "medium",
+                })
+
+        conn.close()
+    except Exception as e:
+        anomalies.append({"column": "_error", "type": "check_error",
+                          "baseline_value": None, "current_value": None,
+                          "deviation_pct": 0, "severity": "low",
+                          "error": str(e)})
+        try: conn.close()
+        except: pass
+    return anomalies
+
+
+@app.post("/api/anomaly/baseline")
+async def build_anomaly_baseline(payload: dict = {}):
+    """
+    Build or refresh baseline for one or more tables.
+    Body: { "tables": ["mws.report", "mws.orders"] }  — omit for all known tables.
+    """
+    tables_req = payload.get("tables", [])
+    if not tables_req:
+        # Default: baseline all tables currently monitored
+        conn = get_connection()
+        rows = q(conn,
+            "SELECT table_schema, table_name FROM information_schema.tables "
+            "WHERE table_type='BASE TABLE' "
+            "AND table_schema NOT IN ('pg_catalog','information_schema','pg_internal') "
+            "ORDER BY table_schema, table_name LIMIT 30")
+        conn.close()
+        tables_req = [f"{r['table_schema']}.{r['table_name']}" for r in rows]
+
+    results = []
+    for t in tables_req:
+        parts = t.split(".", 1)
+        schema, table = (parts[0], parts[1]) if len(parts) == 2 else ("mws", parts[0])
+        key = _baseline_key(schema, table)
+        baseline = await asyncio.to_thread(_build_baseline, schema, table)
+        _baselines[key] = baseline
+        results.append({"table": t, "row_count": baseline.get("row_count"),
+                         "columns_profiled": len(baseline.get("null_rates", {})),
+                         "error": baseline.get("error")})
+
+    return {"built": len(results), "tables": results,
+            "computed_at": datetime.datetime.utcnow().isoformat()}
+
+
+@app.get("/api/anomaly/check")
+async def check_anomalies(tables: str = ""):
+    """
+    Compare current table stats to stored baselines.
+    ?tables=mws.report,mws.orders  — omit for all baselined tables.
+    Returns anomalies with severity, deviation %, and LLM root-cause summary.
+    """
+    target_tables = [t.strip() for t in tables.split(",") if t.strip()] if tables else list(_baselines.keys())
+    if not target_tables:
+        return {"anomalies": [], "message": "No baselines built yet. Call POST /api/anomaly/baseline first."}
+
+    all_anomalies = []
+    for t in target_tables:
+        parts = t.split(".", 1)
+        schema, table = (parts[0], parts[1]) if len(parts) == 2 else ("mws", parts[0])
+        key = _baseline_key(schema, table)
+        baseline = _baselines.get(key)
+        if not baseline:
+            continue
+        anomalies = await asyncio.to_thread(_check_anomalies, schema, table, baseline)
+        if anomalies:
+            all_anomalies.append({"table": t, "anomalies": anomalies,
+                                   "baseline_age_h": round(
+                                       (datetime.datetime.utcnow() -
+                                        datetime.datetime.fromisoformat(baseline["computed_at"][:19])
+                                       ).total_seconds() / 3600, 1)})
+
+    # LLM root-cause summary if anomalies found
+    summary = None
+    if all_anomalies:
+        try:
+            api_key = os.getenv("OPENAI_API_KEY","")
+            if api_key:
+                async with httpx.AsyncClient(timeout=20) as client:
+                    r = await client.post(
+                        "https://api.openai.com/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {api_key}",
+                                 "Content-Type": "application/json"},
+                        json={"model":"gpt-4o","max_tokens":300,
+                              "messages":[
+                                {"role":"system","content":
+                                 "You are WiziAgent. Summarise these data anomalies in 2-3 sentences. "
+                                 "Focus on the most critical, suggest likely root causes, and recommend immediate action. "
+                                 "Be concise and direct."},
+                                {"role":"user","content": json.dumps(all_anomalies, indent=2)}
+                              ]}
+                    )
+                    body = r.json()
+                    summary = body.get("choices",[{}])[0].get("message",{}).get("content","")
+        except Exception:
+            pass
+
+    return {"checked_at": datetime.datetime.utcnow().isoformat(),
+            "tables_checked": len(target_tables),
+            "tables_with_anomalies": len(all_anomalies),
+            "anomalies": all_anomalies,
+            "summary": summary}
+
+
+@app.get("/api/anomaly/baselines")
+def list_baselines():
+    """List all stored baselines with their age and table stats."""
+    return [
+        {"table": k,
+         "row_count": v.get("row_count"),
+         "columns_profiled": len(v.get("null_rates", {})),
+         "computed_at": v.get("computed_at"),
+         "weekday": v.get("weekday")}
+        for k, v in _baselines.items()
+    ]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FIX HISTORY INTELLIGENCE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/fix-history/summary")
+async def fix_history_summary(payload: dict = {}):
+    """
+    Generate an AI-powered weekly summary of fix history.
+    Body: { "history": [{action, table, rows_affected, success, ts, durationMs}] }
+    Returns: { summary, patterns, hotspots, recommendations }
+    """
+    history = payload.get("history", [])
+    if not history:
+        return {"error": "No history provided", "summary": None}
+
+    api_key = os.getenv("OPENAI_API_KEY","")
+    if not api_key:
+        return {"error": "OPENAI_API_KEY not set", "summary": None}
+
+    # Compute basic stats server-side to reduce token usage
+    from collections import Counter
+    action_counts = Counter(h.get("action","?") for h in history)
+    table_counts  = Counter(h.get("table","?") for h in history)
+    total_rows    = sum(h.get("rows_affected",0) or 0 for h in history)
+    failures      = [h for h in history if not h.get("success",True)]
+    avg_duration  = (
+        sum(h["durationMs"] for h in history if h.get("durationMs")) /
+        max(len([h for h in history if h.get("durationMs")]), 1)
+    )
+
+    stats = {
+        "total_fixes": len(history),
+        "total_rows_affected": int(total_rows),
+        "failures": len(failures),
+        "avg_duration_ms": round(avg_duration),
+        "action_breakdown": dict(action_counts.most_common(10)),
+        "table_breakdown": dict(table_counts.most_common(10)),
+        "recent_sample": history[-5:],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}",
+                         "Content-Type": "application/json"},
+                json={"model":"gpt-4o","max_tokens":500,
+                      "messages":[
+                        {"role":"system","content":
+                         ("You are WiziAgent, a data operations analyst for Intentwise. "  
+                          "Analyse this fix history and respond ONLY with JSON (no markdown). "  
+                          'Return: {"summary":"...","patterns":[...],"hotspots":[{"table":"...","issue":"...","frequency":"high|medium"}],"recommendations":[...],"health_score":0}' 
+                         )},
+                        {"role":"user","content": json.dumps(stats, indent=2)}
+                      ]}
+            )
+            body = r.json()
+            text = body.get("choices",[{}])[0].get("message",{}).get("content","")
+            parsed = json.loads(text.replace("```json","").replace("```","").strip())
+            return {**parsed, "stats": stats,
+                    "generated_at": datetime.datetime.utcnow().isoformat()}
+    except Exception as e:
+        return {"error": str(e), "stats": stats, "summary": None}
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SLACK SLASH COMMAND — /wizi approve|reject TOKEN
+# Configure in Slack App settings:
+#   Slash command: /wizi
+#   Request URL: https://intentwise-backend-production.up.railway.app/api/slack/command
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/slack/command")
+async def slack_slash_command(request):
+    from fastapi.responses import JSONResponse
+    body = await request.form()
+    text      = (body.get("text") or "").strip()
+    user_name = body.get("user_name", "unknown")
+    parts     = text.split()
+    cmd       = parts[0].lower() if parts else ""
+    arg       = parts[1] if len(parts) > 1 else ""
+
+    def reply(msg, ephemeral=False):
+        return JSONResponse({"response_type": "ephemeral" if ephemeral else "in_channel", "text": msg})
+
+    if cmd in ("approve", "reject"):
+        if not arg:
+            return reply("Usage: `/wizi approve TOKEN` or `/wizi reject TOKEN`", ephemeral=True)
+        entry = _approval_store.get(arg)
+        if not entry:
+            return reply(f"Token `{arg}` not found or already resolved.", ephemeral=True)
+        if entry.get("decision") is not None:
+            return reply(f"Token `{arg}` already resolved: *{entry['decision']}*", ephemeral=True)
+        entry["decision"] = cmd
+        entry["event"].set()
+        emoji = "\u2705" if cmd == "approve" else "\u274c"
+        return reply(f"{emoji} *WiziAgent fix {cmd}d* by @{user_name}\nToken: `{arg}`")
+
+    elif cmd == "status":
+        if not arg:
+            pending = [(t, e) for t, e in _approval_store.items() if e.get("decision") is None]
+            if not pending:
+                return reply("\u2705 No pending approvals.", ephemeral=True)
+            lines = [f"*{len(pending)} pending approval(s):*"]
+            for t, _ in pending[:10]:
+                lines.append(f"  \u2022 Token: `{t}` \u2014 `/wizi approve {t}` or `/wizi reject {t}`")
+            return reply("\n".join(lines))
+        entry = _approval_store.get(arg)
+        if not entry:
+            return reply(f"Token `{arg}` not found.", ephemeral=True)
+        d = entry.get("decision")
+        status_str = "pending \u23f3" if d is None else ("approved \u2705" if d == "approve" else "rejected \u274c")
+        return reply(f"Token `{arg}`: {status_str}")
+
+    elif cmd == "check":
+        if not _baselines:
+            return reply("No baselines built yet. Run a workflow first.", ephemeral=True)
+        result = await check_anomalies()
+        n = result.get("tables_with_anomalies", 0)
+        if n == 0:
+            return reply(f"\u2705 All {result.get('tables_checked', 0)} table(s) look normal.")
+        summary = result.get("summary") or f"{n} table(s) have anomalies."
+        return reply(f"\u26a0\ufe0f *Anomaly Check*\n{summary}")
+
+    elif cmd == "baselines":
+        bl = list_baselines()
+        if not bl:
+            return reply("No baselines stored. POST /api/anomaly/baseline to build them.", ephemeral=True)
+        lines = [f"*{len(bl)} baseline(s):*"]
+        for b in bl[:10]:
+            age_h = ""
+            try:
+                dt = datetime.datetime.fromisoformat(b["computed_at"][:19])
+                age_h = f" \u00b7 {round((datetime.datetime.utcnow()-dt).total_seconds()/3600,1)}h ago"
+            except Exception:
+                pass
+            lines.append(f"  \u2022 `{b['table']}` \u2014 {b['row_count']:,} rows, {b['columns_profiled']} cols{age_h}")
+        return reply("\n".join(lines), ephemeral=True)
+
+    else:
+        help_lines = [
+            "*WiziAgent Slack Commands:*",
+            "  `/wizi approve TOKEN`   \u2014 Approve a pending fix",
+            "  `/wizi reject TOKEN`    \u2014 Reject a pending fix",
+            "  `/wizi status`          \u2014 List all pending approvals",
+            "  `/wizi status TOKEN`    \u2014 Check a specific token",
+            "  `/wizi check`           \u2014 Run anomaly check",
+            "  `/wizi baselines`       \u2014 List stored baselines",
+            "  `/wizi help`            \u2014 Show this message",
+        ]
+        return reply("\n".join(help_lines), ephemeral=True)
