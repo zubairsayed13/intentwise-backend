@@ -3871,3 +3871,365 @@ def get_eval_suite():
         "case_count": len(v["cases"]),
         "cases": [{"id":c["id"],"name":c["name"]} for c in v["cases"]],
     } for k, v in EVAL_SUITE.items()}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FILE UPLOAD → REDSHIFT STAGING
+# Uploads land in wz_uploads schema as persistent staging tables.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import re as _re
+
+def _safe_col(name: str) -> str:
+    """Convert column name to safe Redshift identifier."""
+    s = str(name).strip().lower()
+    s = _re.sub(r'[^a-z0-9_]', '_', s)
+    s = _re.sub(r'_+', '_', s).strip('_')
+    if not s or s[0].isdigit():
+        s = 'col_' + s
+    return s[:127]  # Redshift max col name length
+
+def _infer_type(values: list) -> str:
+    """Infer Redshift column type from a sample of values."""
+    non_null = [v for v in values if v is not None and str(v).strip() != '']
+    if not non_null:
+        return 'VARCHAR(512)'
+    # Try int
+    try:
+        [int(v) for v in non_null[:20]]
+        return 'BIGINT'
+    except (ValueError, TypeError): pass
+    # Try float
+    try:
+        [float(v) for v in non_null[:20]]
+        return 'FLOAT8'
+    except (ValueError, TypeError): pass
+    # Try date
+    import re as _re2
+    date_pat = _re2.compile(r'^\d{4}-\d{2}-\d{2}$')
+    if all(date_pat.match(str(v)) for v in non_null[:10]):
+        return 'DATE'
+    # Default: varchar sized to content
+    max_len = max(len(str(v)) for v in non_null)
+    size = max(64, min(max_len * 2 + 32, 65535))
+    return f'VARCHAR({size})'
+
+def _ensure_uploads_schema(conn):
+    cur = conn.cursor()
+    cur.execute("CREATE SCHEMA IF NOT EXISTS wz_uploads")
+    conn.commit()
+    cur.close()
+
+@app.post("/api/uploads")
+async def create_upload(payload: dict = {}):
+    """
+    Receive parsed file data and create a staging table in wz_uploads.
+    Body: { filename, rows: [{col: val}], columns: [str], db_key: "default" }
+    Returns: { table, schema, full_table, row_count, columns }
+    """
+    filename  = payload.get("filename", "upload")
+    rows      = payload.get("rows", [])
+    cols_in   = payload.get("columns", [])
+    db_key    = payload.get("db_key", "default")
+
+    if not rows:
+        return {"error": "No rows provided"}
+
+    # Build safe table name: slug of filename + timestamp
+    ts      = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    slug    = _re.sub(r'[^a-z0-9]+', '_', filename.lower().rsplit('.',1)[0])[:40].strip('_')
+    tbl     = f"{slug}_{ts}"
+    full    = f"wz_uploads.{tbl}"
+
+    # Safe column names
+    if cols_in:
+        safe_cols = [_safe_col(c) for c in cols_in]
+    else:
+        safe_cols = [_safe_col(k) for k in rows[0].keys()]
+
+    # Deduplicate column names
+    seen = {}
+    deduped = []
+    for c in safe_cols:
+        if c in seen:
+            seen[c] += 1
+            deduped.append(f"{c}_{seen[c]}")
+        else:
+            seen[c] = 0
+            deduped.append(c)
+    safe_cols = deduped
+
+    # Infer types from first 100 rows
+    orig_cols = cols_in or list(rows[0].keys())
+    col_types = {}
+    for i, col in enumerate(orig_cols):
+        sample = [r.get(col) for r in rows[:100]]
+        col_types[safe_cols[i]] = _infer_type(sample)
+
+    try:
+        conn = get_connection(db_key)
+        _ensure_uploads_schema(conn)
+        cur  = conn.cursor()
+
+        # Create table
+        col_defs = ", ".join(f'"{c}" {col_types[c]}' for c in safe_cols)
+        cur.execute(f'CREATE TABLE IF NOT EXISTS {full} ({col_defs})')
+
+        # Bulk insert via executemany
+        placeholders = ", ".join(["%s"] * len(safe_cols))
+        insert_sql   = f'INSERT INTO {full} VALUES ({placeholders})'
+        batch_rows   = []
+        for row in rows:
+            vals = []
+            for orig in orig_cols:
+                v = row.get(orig)
+                vals.append(None if v == "" or v is None else v)
+            batch_rows.append(tuple(vals))
+
+        # Insert in batches of 500
+        for i in range(0, len(batch_rows), 500):
+            cur.executemany(insert_sql, batch_rows[i:i+500])
+        conn.commit()
+
+        # Store metadata in a registry table
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS wz_uploads._registry (
+                table_name VARCHAR(256),
+                filename   VARCHAR(512),
+                row_count  INT,
+                col_count  INT,
+                columns    VARCHAR(65535),
+                db_key     VARCHAR(64),
+                uploaded_at TIMESTAMP DEFAULT GETDATE()
+            )
+        """)
+        cur.execute(
+            "INSERT INTO wz_uploads._registry VALUES (%s,%s,%s,%s,%s,%s,GETDATE())",
+            [tbl, filename, len(rows), len(safe_cols), json.dumps(safe_cols), db_key]
+        )
+        conn.commit()
+        cur.close(); conn.close()
+
+        return {
+            "table":      tbl,
+            "schema":     "wz_uploads",
+            "full_table": full,
+            "row_count":  len(rows),
+            "col_count":  len(safe_cols),
+            "columns":    [{"name": safe_cols[i], "type": col_types[safe_cols[i]], "original": orig_cols[i]} for i in range(len(safe_cols))],
+            "filename":   filename,
+            "db_key":     db_key,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/uploads")
+def list_uploads(db_key: str = Query("default")):
+    """List all uploaded staging tables from the registry."""
+    try:
+        conn = get_connection(db_key)
+        try:
+            rows = q(conn, """
+                SELECT table_name, filename, row_count, col_count, columns,
+                       uploaded_at::text AS uploaded_at
+                FROM wz_uploads._registry
+                ORDER BY uploaded_at DESC
+                LIMIT 100
+            """)
+            conn.close()
+            return {"uploads": [dict(r) for r in rows]}
+        except Exception:
+            conn.close()
+            return {"uploads": []}
+    except Exception as e:
+        return {"error": str(e), "uploads": []}
+
+
+@app.delete("/api/uploads/{table_name}")
+async def delete_upload(table_name: str, db_key: str = Query("default")):
+    """Drop a staging table and remove from registry."""
+    # Safety: only allow dropping wz_uploads tables
+    if not _re.match(r'^[a-z0-9_]+$', table_name):
+        return {"error": "Invalid table name"}
+    try:
+        conn = get_connection(db_key)
+        cur  = conn.cursor()
+        cur.execute(f"DROP TABLE IF EXISTS wz_uploads.{table_name}")
+        cur.execute("DELETE FROM wz_uploads._registry WHERE table_name = %s", [table_name])
+        conn.commit()
+        cur.close(); conn.close()
+        return {"deleted": table_name}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/uploads/{table_name}/preview")
+def preview_upload(table_name: str, limit: int = Query(50), db_key: str = Query("default")):
+    """Preview rows from a staging table."""
+    if not _re.match(r'^[a-z0-9_]+$', table_name):
+        return {"error": "Invalid table name"}
+    try:
+        conn = get_connection(db_key)
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(f"SELECT * FROM wz_uploads.{table_name} LIMIT %s", [limit])
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description] if cur.description else []
+        cur.close(); conn.close()
+        return {"columns": cols, "rows": [dict(r) for r in rows], "count": len(rows)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DASHBOARD WIDGET STORE
+# Widgets are stored in Redshift (wz_uploads._dashboard_widgets) for persistence
+# and shared across all users. In-memory cache speeds up reads.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_widget_cache: list = []   # in-memory cache, refreshed on save/delete
+_widget_cache_loaded = False
+
+BUILTIN_WIDGETS = [
+    {"id":"wgt_kpi_revenue",  "title":"Revenue",          "type":"kpi",   "sql":"",                              "x_col":"","y_col":"value","size":"small","order":0, "visible":True,"color":"#6366f1","builtin":True,"kpi_key":"sales.total_sales",  "kpi_format":"currency"},
+    {"id":"wgt_kpi_orders",   "title":"Orders",            "type":"kpi",   "sql":"",                              "x_col":"","y_col":"value","size":"small","order":1, "visible":True,"color":"#0ea5e9","builtin":True,"kpi_key":"orders.total",        "kpi_format":"number"},
+    {"id":"wgt_kpi_sessions", "title":"Sessions",          "type":"kpi",   "sql":"",                              "x_col":"","y_col":"value","size":"small","order":2, "visible":True,"color":"#8b5cf6","builtin":True,"kpi_key":"sales.sessions",      "kpi_format":"number"},
+    {"id":"wgt_kpi_buybox",   "title":"Buy Box %",         "type":"kpi",   "sql":"",                              "x_col":"","y_col":"value","size":"small","order":3, "visible":True,"color":"#10b981","builtin":True,"kpi_key":"sales.buy_box_pct",   "kpi_format":"percent"},
+    {"id":"wgt_kpi_oos",      "title":"Out of Stock",      "type":"kpi",   "sql":"",                              "x_col":"","y_col":"value","size":"small","order":4, "visible":True,"color":"#ef4444","builtin":True,"kpi_key":"inventory.out_of_stock","kpi_format":"number"},
+    {"id":"wgt_kpi_issues",   "title":"Open Issues",       "type":"kpi",   "sql":"",                              "x_col":"","y_col":"value","size":"small","order":5, "visible":True,"color":"#f59e0b","builtin":True,"kpi_key":"triage.issue_count",  "kpi_format":"number"},
+    {"id":"wgt_trend",        "title":"30-Day Trend",      "type":"area",  "sql":"SELECT sale_date::text AS day, SUM(ordered_product_sales_amt) AS revenue, SUM(units_ordered) AS units FROM mws.sales_and_traffic_by_date WHERE sale_date >= CURRENT_DATE - 30 GROUP BY sale_date ORDER BY day",
+                                                                           "x_col":"day","y_col":"revenue",       "size":"large","order":6, "visible":True,"color":"#6366f1","builtin":True},
+    {"id":"wgt_order_status", "title":"Order Status",      "type":"donut", "sql":"SELECT order_status AS label, COUNT(*) AS value FROM mws.orders WHERE download_date=(SELECT MAX(download_date) FROM mws.orders) GROUP BY order_status",
+                                                                           "x_col":"label","y_col":"value",       "size":"medium","order":7,"visible":True,"color":"#6366f1","builtin":True},
+    {"id":"wgt_top_asins",    "title":"Top ASINs",         "type":"bar",   "sql":"SELECT child_asin AS asin, SUM(ordered_product_sales_amt) AS revenue FROM mws.sales_and_traffic_by_asin WHERE download_date=(SELECT MAX(download_date) FROM mws.sales_and_traffic_by_asin) GROUP BY child_asin ORDER BY revenue DESC LIMIT 10",
+                                                                           "x_col":"revenue","y_col":"asin",      "size":"medium","order":8,"visible":True,"color":"#6366f1","builtin":True},
+    {"id":"wgt_issues",       "title":"Issues by Type",    "type":"bar",   "sql":"",                              "x_col":"code","y_col":"count",            "size":"medium","order":9,"visible":True,"color":"#f59e0b","builtin":True,"triage_chart":True},
+    {"id":"wgt_wf_history",   "title":"Workflow Runs",     "type":"bar",   "sql":"",                              "x_col":"name","y_col":"issues",           "size":"medium","order":10,"visible":True,"color":"#10b981","builtin":True,"wf_chart":True},
+    {"id":"wgt_inventory",    "title":"Inventory Snapshot","type":"bars",  "sql":"",                              "x_col":"","y_col":"",                     "size":"medium","order":11,"visible":True,"color":"#10b981","builtin":True,"inventory_chart":True},
+    {"id":"wgt_health",       "title":"Pipeline Health",   "type":"line",  "sql":"",                              "x_col":"day","y_col":"score",             "size":"medium","order":12,"visible":True,"color":"#10b981","builtin":True,"health_chart":True},
+]
+
+def _load_widgets_from_db(db_key="default") -> list:
+    """Load custom widget overrides from Redshift. Returns merged list."""
+    global _widget_cache, _widget_cache_loaded
+    try:
+        conn = get_connection(db_key)
+        try:
+            rows = q(conn, "SELECT widget_json FROM wz_uploads._dashboard_widgets ORDER BY widget_order ASC")
+            conn.close()
+            custom = [json.loads(r["widget_json"]) for r in rows]
+            # Merge: custom overrides builtins by id, then appended
+            builtin_map = {w["id"]: dict(w) for w in BUILTIN_WIDGETS}
+            for cw in custom:
+                if cw["id"] in builtin_map:
+                    builtin_map[cw["id"]].update(cw)
+                else:
+                    builtin_map[cw["id"]] = cw
+            merged = sorted(builtin_map.values(), key=lambda w: w.get("order", 99))
+            _widget_cache = merged
+            _widget_cache_loaded = True
+            return merged
+        except Exception:
+            conn.close()
+    except Exception:
+        pass
+    # Fallback: return builtins only
+    _widget_cache = [dict(w) for w in BUILTIN_WIDGETS]
+    _widget_cache_loaded = True
+    return _widget_cache
+
+def _save_widget_to_db(widget: dict, db_key="default"):
+    """Upsert a single widget to Redshift."""
+    try:
+        conn = get_connection(db_key)
+        cur  = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS wz_uploads._dashboard_widgets (
+                widget_id    VARCHAR(64) PRIMARY KEY,
+                widget_json  VARCHAR(65535),
+                widget_order INT DEFAULT 0
+            )
+        """)
+        # DELETE + INSERT (Redshift doesn't support ON CONFLICT)
+        cur.execute("DELETE FROM wz_uploads._dashboard_widgets WHERE widget_id = %s", [widget["id"]])
+        cur.execute("INSERT INTO wz_uploads._dashboard_widgets VALUES (%s, %s, %s)",
+                    [widget["id"], json.dumps(widget), widget.get("order", 99)])
+        conn.commit()
+        cur.close(); conn.close()
+    except Exception:
+        pass
+
+
+@app.get("/api/dashboard/widgets")
+def get_dashboard_widgets():
+    """Return the full ordered widget list (builtins + custom overrides)."""
+    global _widget_cache_loaded
+    if not _widget_cache_loaded:
+        _load_widgets_from_db()
+    return {"widgets": _widget_cache}
+
+
+@app.post("/api/dashboard/widgets")
+async def save_dashboard_widget(payload: dict = {}):
+    """
+    Upsert a widget. Body is the full widget object.
+    For builtins: only visible/order/size/color/title can be changed.
+    For custom: full widget including sql.
+    """
+    global _widget_cache, _widget_cache_loaded
+    wid = payload.get("id")
+    if not wid:
+        payload["id"] = f"wgt_{uuid.uuid4().hex[:8]}"
+
+    # Reload cache if needed
+    if not _widget_cache_loaded:
+        _load_widgets_from_db()
+
+    # Merge into cache
+    existing_idx = next((i for i,w in enumerate(_widget_cache) if w["id"]==payload["id"]), None)
+    if existing_idx is not None:
+        _widget_cache[existing_idx] = {**_widget_cache[existing_idx], **payload}
+    else:
+        _widget_cache.append(payload)
+        _widget_cache.sort(key=lambda w: w.get("order", 99))
+
+    _save_widget_to_db(payload)
+    return {"saved": True, "widget": payload}
+
+
+@app.post("/api/dashboard/widgets/reorder")
+async def reorder_dashboard_widgets(payload: dict = {}):
+    """
+    Bulk reorder. Body: { "order": ["wgt_id1", "wgt_id2", ...] }
+    """
+    global _widget_cache
+    ids = payload.get("order", [])
+    order_map = {wid: i for i, wid in enumerate(ids)}
+    for w in _widget_cache:
+        if w["id"] in order_map:
+            w["order"] = order_map[w["id"]]
+            _save_widget_to_db(w)
+    _widget_cache.sort(key=lambda w: w.get("order", 99))
+    return {"reordered": True}
+
+
+@app.delete("/api/dashboard/widgets/{widget_id}")
+async def delete_dashboard_widget(widget_id: str):
+    """Delete a custom widget. Builtins get visible=False instead."""
+    global _widget_cache
+    w = next((w for w in _widget_cache if w["id"] == widget_id), None)
+    if not w:
+        return {"error": "Widget not found"}
+    if w.get("builtin"):
+        w["visible"] = False
+        _save_widget_to_db(w)
+        return {"hidden": True, "widget_id": widget_id}
+    else:
+        _widget_cache = [x for x in _widget_cache if x["id"] != widget_id]
+        try:
+            conn = get_connection()
+            cur  = conn.cursor()
+            cur.execute("DELETE FROM wz_uploads._dashboard_widgets WHERE widget_id = %s", [widget_id])
+            conn.commit(); cur.close(); conn.close()
+        except Exception: pass
+        return {"deleted": True, "widget_id": widget_id}
