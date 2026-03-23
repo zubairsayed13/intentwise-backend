@@ -33,12 +33,72 @@ async def lifespan(app):
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-def get_connection():
+# ── Connection Registry ──────────────────────────────────────────────────────
+# Supports multiple databases. Each db_key maps to a set of env vars.
+# Default key "default" uses REDSHIFT_* env vars (backwards compatible).
+# Add new databases via env vars: DB_{KEY}_HOST, DB_{KEY}_PORT, etc.
+# or by calling /api/config/db-connections to register at runtime.
+#
+# Example for a second DB:
+#   DB_WALMART_HOST=...  DB_WALMART_PORT=5439  DB_WALMART_DB=...
+#   DB_WALMART_USER=...  DB_WALMART_PASSWORD=...
+#
+_DB_REGISTRY: dict = {}   # { db_key: { host, port, dbname, user, password } }
+
+def _get_db_config(db_key: str = "default") -> dict:
+    """Resolve DB config for a given key. Falls back to default env vars."""
+    if db_key in _DB_REGISTRY:
+        return _DB_REGISTRY[db_key]
+    prefix = f"DB_{db_key.upper()}_"
+    host = os.getenv(f"{prefix}HOST") or os.getenv("REDSHIFT_HOST")
+    if host:
+        return {
+            "host":     host,
+            "port":     int(os.getenv(f"{prefix}PORT", os.getenv("REDSHIFT_PORT", 5439))),
+            "dbname":   os.getenv(f"{prefix}DB",       os.getenv("REDSHIFT_DB")),
+            "user":     os.getenv(f"{prefix}USER",     os.getenv("REDSHIFT_USER")),
+            "password": os.getenv(f"{prefix}PASSWORD", os.getenv("REDSHIFT_PASSWORD")),
+        }
+    # Fallback to default
+    return {
+        "host":     os.getenv("REDSHIFT_HOST"),
+        "port":     int(os.getenv("REDSHIFT_PORT", 5439)),
+        "dbname":   os.getenv("REDSHIFT_DB"),
+        "user":     os.getenv("REDSHIFT_USER"),
+        "password": os.getenv("REDSHIFT_PASSWORD"),
+    }
+
+def get_connection(db_key: str = "default"):
+    """Get a DB connection by key. Default is backwards-compatible with REDSHIFT_* env vars."""
+    cfg = _get_db_config(db_key)
     return psycopg2.connect(
-        host=os.getenv("REDSHIFT_HOST"), port=int(os.getenv("REDSHIFT_PORT", 5439)),
-        dbname=os.getenv("REDSHIFT_DB"), user=os.getenv("REDSHIFT_USER"),
-        password=os.getenv("REDSHIFT_PASSWORD"), sslmode="require"
+        host=cfg["host"], port=cfg["port"], dbname=cfg["dbname"],
+        user=cfg["user"], password=cfg["password"], sslmode="require"
     )
+
+@app.get("/api/config/db-connections")
+def list_db_connections():
+    """List registered database connections (no passwords)."""
+    configs = {}
+    for key in set(list(_DB_REGISTRY.keys()) + ["default"]):
+        cfg = _get_db_config(key)
+        configs[key] = {"host": cfg.get("host"), "port": cfg.get("port"),
+                        "dbname": cfg.get("dbname"), "user": cfg.get("user")}
+    return {"connections": configs}
+
+@app.post("/api/config/db-connections")
+async def register_db_connection(payload: dict = {}):
+    """Register a new database connection at runtime."""
+    key = payload.get("key","").strip().lower().replace(" ","_")
+    if not key: return {"error": "key is required"}
+    _DB_REGISTRY[key] = {
+        "host":     payload.get("host",""),
+        "port":     int(payload.get("port", 5439)),
+        "dbname":   payload.get("dbname",""),
+        "user":     payload.get("user",""),
+        "password": payload.get("password",""),
+    }
+    return {"registered": key, "connections": list(_DB_REGISTRY.keys())}
 
 def q(conn, sql, params=None):
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -2186,277 +2246,182 @@ def _cron_is_due(cron_expr: str, last_run_iso: str | None) -> bool:
         return False
 
 
+async def _run_one_table(table_str: str, agent_name: str, table_checks: dict,
+                         db_key: str = "default") -> dict:
+    """Run checks on a single table — used for parallel execution."""
+    custom_checks = table_checks.get(table_str, [])
+    parts  = table_str.split(".", 1)
+    schema = parts[0] if len(parts) == 2 else "mws"
+    table  = parts[1] if len(parts) == 2 else parts[0]
+
+    if custom_checks:
+        try:
+            all_sub_checks = [chk for cs in custom_checks for chk in cs.get("checks", [])]
+            conn = get_connection(db_key)
+            check_issues, check_trace = [], []
+            for chk in all_sub_checks:
+                sql = chk.get("sql","").strip()
+                cond = chk.get("pass_condition","rows > 0")
+                if not sql: continue
+                try:
+                    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+                    cur.execute(sql)
+                    rows_out = cur.fetchmany(200)
+                    cols = [d[0] for d in cur.description] if cur.description else []
+                    cur.close()
+                    row_dicts = [dict(r) for r in rows_out]
+                    rc = len(row_dicts)
+                    try:
+                        if cond.startswith("rows"):
+                            op, val = cond.split()[1], int(cond.split()[2])
+                            passed = eval(f"{rc} {op} {val}")
+                        elif cond.startswith("value") and row_dicts:
+                            fv = list(row_dicts[0].values())[0]
+                            op, val = cond.split()[1], float(cond.split()[2])
+                            passed = eval(f"{float(fv or 0)} {op} {val}")
+                        else:
+                            passed = rc > 0
+                    except Exception:
+                        passed = rc > 0
+                    check_trace.append({"node": chk.get("name",""), "msg": f"{'PASS' if passed else 'FAIL'} — {rc} rows", "level": "success" if passed else "warning"})
+                    if not passed:
+                        check_issues.append({"type":"check_fail","check_name":chk.get("name",""),"count":rc,"severity":"high","msg":f"Check '{chk.get('name','')}' failed: {cond}","sample_rows":row_dicts[:5],"columns":cols})
+                except Exception as ex:
+                    check_issues.append({"type":"error","check_name":chk.get("name",""),"msg":str(ex)[:100],"severity":"high","count":0})
+            conn.close()
+            return {"table":table_str,"agent":agent_name,"status":"done" if not check_issues else "issues_found","issues":check_issues,"trace":check_trace,"check_sets":[cs.get("name","") for cs in custom_checks]}
+        except Exception as e:
+            return {"table":table_str,"agent":agent_name,"status":"error","issues":[{"type":"error","msg":str(e),"severity":"high"}],"trace":[]}
+
+    # Generic fallback checks
+    try:
+        if LANGGRAPH_AVAILABLE:
+            init = {"schema":schema,"table":table,"account":None,"threshold":50,"total_rows":0,"alerts":[],"classification":None,"fix_results":[],"verify_alerts":[],"notified":False,"trace":[],"status":"running","error":None}
+            graph  = get_table_agent_graph()
+            result = await asyncio.to_thread(graph.invoke, init)
+            return {"table":table_str,"agent":agent_name,"status":result.get("status","done"),"issues":result.get("alerts",[]),"trace":result.get("trace",[])}
+        else:
+            conn   = get_connection(db_key)
+            issues, trace = [], []
+            try:
+                rows = q(conn, f"SELECT COUNT(*) AS cnt FROM {schema}.{table}")
+                total = rows[0]["cnt"] if rows else 0
+                trace.append({"node":"count","msg":f"{total} rows in {table_str}"})
+                col_rows = q(conn, "SELECT column_name FROM information_schema.columns WHERE table_schema=%s AND table_name=%s AND data_type IN ('character varying','varchar','text') LIMIT 1", [schema, table])
+                if col_rows:
+                    col = col_rows[0]["column_name"]
+                    null_cnt = q(conn, f"SELECT COUNT(*) AS cnt FROM {schema}.{table} WHERE {col} IS NULL")[0]["cnt"]
+                    if null_cnt > 0:
+                        issues.append({"type":"null","column":col,"count":null_cnt,"severity":"high" if null_cnt>10 else "medium"})
+                date_cols = q(conn, "SELECT column_name FROM information_schema.columns WHERE table_schema=%s AND table_name=%s AND data_type IN ('date','timestamp','timestamp without time zone','timestamp with time zone') LIMIT 1", [schema, table])
+                if date_cols:
+                    dc = date_cols[0]["column_name"]
+                    fresh = q(conn, f"SELECT MAX({dc})::text AS latest FROM {schema}.{table}")
+                    latest = fresh[0]["latest"] if fresh else None
+                    trace.append({"node":"freshness","msg":f"latest {dc}: {latest}"})
+                    if latest:
+                        try:
+                            age_h = (datetime.datetime.utcnow() - datetime.datetime.fromisoformat(str(latest)[:19])).total_seconds()/3600
+                            if age_h > 26:
+                                issues.append({"type":"freshness","column":dc,"age_hours":round(age_h,1),"severity":"critical" if age_h>48 else "high"})
+                        except Exception: pass
+                conn.close()
+            except Exception as ex:
+                issues.append({"type":"error","msg":str(ex),"severity":"high"})
+                try: conn.close()
+                except Exception: pass
+            return {"table":table_str,"agent":agent_name,"status":"done","issues":issues,"trace":trace}
+    except Exception as e:
+        return {"table":table_str,"agent":agent_name,"status":"error","issues":[{"type":"error","msg":str(e),"severity":"high"}],"trace":[]}
+
+
 async def _run_custom_workflow(wf: dict, triggered_by: str = "manual") -> dict:
     """
-    Execute a custom workflow:
-    1. Loop through wf["tables"], run Table Agent on each
-    2. Apply branching rules after each agent result
-    3. Consolidate issues, return summary
+    Execute a custom workflow — tables run in PARALLEL via asyncio.gather.
+    Branching rules that depend on ordering (stop/skip) are applied post-gather.
+    db_key is resolved from wf["db_key"] or defaults to "default".
     """
     run_id    = f"cwf_{uuid.uuid4().hex[:8]}"
     started   = datetime.datetime.utcnow().isoformat()
     tables    = wf.get("tables", [])
     branches  = wf.get("branches", [])
     agents    = wf.get("agents", [])
-    results   = []
-    all_issues = []
-    stopped   = False
-    skip_rest = False
-    slack_url = os.getenv("SLACK_WEBHOOK_URL", "")
-
-    # Support per-table check sets: wf["table_checks"] = {"schema.table": [{id,name,sql,pass_condition},...]}
+    db_key    = wf.get("db_key", "default")
+    slack_url = wf.get("slack_channel") or os.getenv("SLACK_WEBHOOK_URL", "")
     table_checks = wf.get("table_checks", {})
 
-    for i, table_str in enumerate(tables):
-        if stopped or skip_rest:
-            results.append({"table": table_str, "skipped": True,
-                            "reason": "stopped" if stopped else "skip_remaining"})
-            continue
+    # ── Run all tables in parallel ────────────────────────────────────────────
+    tasks = [
+        _run_one_table(table_str, agents[i] if i < len(agents) else f"Agent{i+1}",
+                       table_checks, db_key)
+        for i, table_str in enumerate(tables)
+    ]
+    results = list(await asyncio.gather(*tasks, return_exceptions=False))
+    all_issues = [issue for r in results for issue in r.get("issues", [])]
 
-        # Parse schema.table
-        parts  = table_str.split(".", 1)
-        schema = parts[0] if len(parts) == 2 else "mws"
-        table  = parts[1] if len(parts) == 2 else parts[0]
-
-        agent_name = agents[i] if i < len(agents) else f"Agent{i+1}"
-
-        # ── If custom checks defined for this table, run them ────────────
-        custom_checks = table_checks.get(table_str, [])
-        if custom_checks:
-            try:
-                # Flatten all sub-checks from all check sets
-                all_sub_checks = []
-                for cs in custom_checks:
-                    for chk in cs.get("checks", []):
-                        all_sub_checks.append(chk)
-
-                conn = get_connection()
-                check_issues = []
-                check_trace  = []
-                for chk in all_sub_checks:
-                    sql = chk.get("sql","").strip()
-                    cond = chk.get("pass_condition","rows > 0")
-                    if not sql: continue
-                    try:
-                        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-                        cur.execute(sql)
-                        rows_out = cur.fetchmany(200)
-                        cols = [d[0] for d in cur.description] if cur.description else []
-                        cur.close()
-                        row_dicts = [dict(r) for r in rows_out]
-                        # Evaluate pass condition
-                        passed = True
-                        try:
-                            rc = len(row_dicts)
-                            if cond.startswith("rows"):
-                                op, val = cond.split()[1], int(cond.split()[2])
-                                passed = eval(f"{rc} {op} {val}")
-                            elif cond.startswith("value") and row_dicts:
-                                fv = list(row_dicts[0].values())[0]
-                                op, val = cond.split()[1], float(cond.split()[2])
-                                passed = eval(f"{float(fv or 0)} {op} {val}")
-                        except Exception:
-                            passed = len(row_dicts) > 0
-                        check_trace.append({"node": chk.get("name","check"),
-                            "msg": f"{'PASS' if passed else 'FAIL'} — {len(row_dicts)} rows",
-                            "level": "success" if passed else "warning"})
-                        if not passed:
-                            check_issues.append({
-                                "type": "check_fail",
-                                "check_name": chk.get("name",""),
-                                "count": len(row_dicts),
-                                "severity": "high",
-                                "msg": f"Check '{chk.get('name','')}' failed: {cond}",
-                                "sample_rows": row_dicts[:5],
-                                "columns": cols,
-                            })
-                    except Exception as ex:
-                        check_issues.append({"type":"error","check_name":chk.get("name",""),
-                            "msg":str(ex)[:100],"severity":"high","count":0})
-                conn.close()
-                step_result = {
-                    "table": table_str, "agent": agent_name,
-                    "status": "done" if not check_issues else "issues_found",
-                    "issues": check_issues, "trace": check_trace,
-                    "check_sets": [cs.get("name","") for cs in custom_checks],
-                }
-                results.append(step_result)
-                all_issues.extend(check_issues)
-                # Apply branching
-                for branch in branches:
-                    after = branch.get("afterAgent","")
-                    if after and after != agent_name: continue
-                    cond_b = branch.get("condition","always")
-                    action = branch.get("action","notify")
-                    fired = (cond_b=="always" or
-                        (cond_b=="on_failure" and len(check_issues)>0) or
-                        (cond_b=="on_success" and len(check_issues)==0))
-                    if not fired: continue
-                    if action=="stop": stopped=True; step_result["branch_action"]="stopped"; break
-                    elif action=="skip_remaining": skip_rest=True; step_result["branch_action"]="skip_remaining"; break
-                continue  # skip generic check below
-            except Exception as e:
-                results.append({"table":table_str,"agent":agent_name,
-                    "status":"error","issues":[{"type":"error","msg":str(e),"severity":"high"}],"trace":[]})
-                all_issues.append({"type":"error","msg":str(e),"severity":"high"})
-                continue
-
-        try:
-            if LANGGRAPH_AVAILABLE:
-                from langchain_openai import ChatOpenAI  # already imported in module
-                init: dict = {
-                    "schema": schema, "table": table, "account": None,
-                    "threshold": 50, "total_rows": 0, "alerts": [],
-                    "classification": None, "fix_results": [], "verify_alerts": [],
-                    "notified": False, "trace": [], "status": "running", "error": None,
-                }
-                graph  = get_table_agent_graph()
-                result = await asyncio.to_thread(graph.invoke, init)
-                issues = result.get("alerts", [])
-                status = result.get("status", "done")
-                trace  = result.get("trace", [])
-            else:
-                # Fallback: raw SQL checks without LangGraph
-                conn   = get_connection()
-                issues = []
-                trace  = []
-                try:
-                    rows = q(conn, f"SELECT COUNT(*) AS cnt FROM {schema}.{table}")
-                    total = rows[0]["cnt"] if rows else 0
-                    trace.append({"node": "count", "msg": f"{total} rows in {table_str}"})
-
-                    # NULL check on first varchar column
-                    col_rows = q(conn, """
-                        SELECT column_name FROM information_schema.columns
-                        WHERE table_schema=%s AND table_name=%s
-                        AND data_type IN ('character varying','varchar','text')
-                        LIMIT 1
-                    """, [schema, table])
-                    if col_rows:
-                        col = col_rows[0]["column_name"]
-                        null_rows = q(conn, f"SELECT COUNT(*) AS cnt FROM {schema}.{table} WHERE {col} IS NULL")
-                        null_cnt = null_rows[0]["cnt"] if null_rows else 0
-                        if null_cnt > 0:
-                            issues.append({"type": "null", "column": col, "count": null_cnt,
-                                           "severity": "high" if null_cnt > 10 else "medium"})
-
-                    # Freshness check
-                    date_cols = q(conn, """
-                        SELECT column_name FROM information_schema.columns
-                        WHERE table_schema=%s AND table_name=%s
-                        AND data_type IN ('date','timestamp','timestamp without time zone',
-                                          'timestamp with time zone')
-                        LIMIT 1
-                    """, [schema, table])
-                    if date_cols:
-                        dc = date_cols[0]["column_name"]
-                        fresh = q(conn, f"SELECT MAX({dc})::text AS latest FROM {schema}.{table}")
-                        latest = fresh[0]["latest"] if fresh else None
-                        trace.append({"node": "freshness", "msg": f"latest {dc}: {latest}"})
-                        if latest:
-                            try:
-                                lat_dt = datetime.datetime.fromisoformat(str(latest)[:19])
-                                age_h  = (datetime.datetime.utcnow() - lat_dt).total_seconds() / 3600
-                                if age_h > 26:
-                                    issues.append({"type": "freshness", "column": dc,
-                                                   "age_hours": round(age_h, 1),
-                                                   "severity": "critical" if age_h > 48 else "high"})
-                            except Exception:
-                                pass
-                    conn.close()
-                    status = "done"
-                except Exception as ex:
-                    status = "error"
-                    issues.append({"type": "error", "msg": str(ex), "severity": "high"})
-                    try: conn.close()
-                    except Exception: pass
-
-        except Exception as e:
-            issues = [{"type": "error", "msg": str(e), "severity": "high"}]
-            status = "error"
-            trace  = []
-
-        step_result = {
-            "table": table_str, "agent": agent_name,
-            "status": status, "issues": issues, "trace": trace,
-        }
-        results.append(step_result)
-        all_issues.extend(issues)
-
-        # ── Apply branching rules ─────────────────────────────────────────
+    # ── Apply branching rules post-parallel ───────────────────────────────────
+    stopped = False
+    for step_result in results:
+        agent_name  = step_result.get("agent","")
+        step_issues = step_result.get("issues", [])
         for branch in branches:
-            after = branch.get("afterAgent", "")
-            if after and after != agent_name:
-                continue  # rule not for this agent
-            cond   = branch.get("condition", "always")
-            action = branch.get("action", "notify")
-            fired  = (
-                cond == "always" or
-                (cond == "on_failure" and (status == "error" or len(issues) > 0)) or
-                (cond == "on_success" and status == "done" and len(issues) == 0)
-            )
-            if not fired:
-                continue
-
+            after = branch.get("afterAgent","")
+            if after and after != agent_name: continue
+            cond_b = branch.get("condition","always")
+            action = branch.get("action","notify")
+            fired  = (cond_b=="always" or
+                (cond_b=="on_failure" and len(step_issues)>0) or
+                (cond_b=="on_success" and len(step_issues)==0))
+            if not fired: continue
             if action == "stop":
                 stopped = True
                 step_result["branch_action"] = "stopped"
                 break
             elif action == "skip_remaining":
-                skip_rest = True
                 step_result["branch_action"] = "skip_remaining"
                 break
-            elif action == "notify":
-                step_result["branch_action"] = "notified"
-                if slack_url and issues:
-                    try:
-                        msg = (f"⚠️ *{wf['name']}* — `{table_str}` ({agent_name})\n"
-                               f"{len(issues)} issue(s): "
-                               + ", ".join(set(iss.get('type','?') for iss in issues)))
-                        httpx.post(slack_url, json={"text": msg}, timeout=5)
-                    except Exception:
-                        pass
-            elif action == "run_agent":
-                step_result["branch_action"] = f"run_agent:{branch.get('target','')}"
+            elif action == "notify" and slack_url:
+                try:
+                    async with httpx.AsyncClient(timeout=5) as client:
+                        msg_b = f"⚠️ *{wf.get('name','')}* — `{step_result['table']}` ({agent_name}) · {len(step_issues)} issue(s) found."
+                        await client.post(slack_url, json={"text": msg_b})
+                    step_result["branch_action"] = "notified"
+                except Exception: pass
 
-    # ── Final Slack summary ───────────────────────────────────────────────────
     total_issues = len(all_issues)
-    run_status   = "issues_found" if total_issues > 0 else "clean"
-    if slack_url and total_issues > 0:
+    status = "clean" if total_issues == 0 else "issues_found"
+    notified = False
+
+    # ── Slack summary ─────────────────────────────────────────────────────────
+    if total_issues > 0 and slack_url:
         try:
-            lines = [f"📋 *{wf['name']}* run complete — {total_issues} issue(s) across {len(tables)} table(s)"]
-            for r in results:
-                if r.get("issues"):
-                    lines.append(f"  • `{r['table']}`: {len(r['issues'])} issue(s)")
-            httpx.post(slack_url, json={"text": "\n".join(lines)}, timeout=5)
-        except Exception:
-            pass
+            wf_name = wf.get('name','')
+            sg = wf.get('schema_group','—')
+            msg = f"\u26a0\ufe0f *{wf_name}* workflow completed\n{total_issues} issue(s) across {len(tables)} table(s)\nSchema group: {sg} \u00b7 DB: {db_key}" 
+            async with httpx.AsyncClient(timeout=5) as client:
+                await client.post(slack_url, json={"text": msg})
+            notified = True
+        except Exception: pass
 
     run_record = {
-        "run_id":       run_id,
-        "workflow_id":  wf.get("id", ""),
-        "workflow_name": wf.get("name", ""),
-        "triggered_by": triggered_by,
-        "started_at":   started,
-        "finished_at":  datetime.datetime.utcnow().isoformat(),
-        "status":       run_status,
-        "total_issues": total_issues,
-        "table_results": results,
+        "run_id":        run_id, "workflow_id": wf.get("id",""), "workflow_name": wf.get("name",""),
+        "schema_group":  wf.get("schema_group",""), "db_key": db_key,
+        "started_at":    started, "triggered_by":  triggered_by,
+        "status":        status,  "total_issues":  total_issues,
+        "table_results": results, "notified":      notified,
+        "parallel":      True,    "table_count":   len(tables),
     }
-
-    # Append to history, cap at 50
-    _wf_run_history.append(run_record)
-    if len(_wf_run_history) > 50:
-        _wf_run_history.pop(0)
+    _wf_run_history.insert(0, run_record)
+    if len(_wf_run_history) > 50: _wf_run_history.pop()
 
     # Update last_run on the stored workflow
     if wf.get("id") and wf["id"] in _CUSTOM_WORKFLOWS:
         _CUSTOM_WORKFLOWS[wf["id"]]["last_run"] = started
-        _CUSTOM_WORKFLOWS[wf["id"]]["run_count"] = \
-            _CUSTOM_WORKFLOWS[wf["id"]].get("run_count", 0) + 1
 
     return run_record
 
+# ─── REMOVE OLD SEQUENTIAL LOOP — replaced by _run_one_table + asyncio.gather above ───
+# The old for loop that was here is replaced. Keeping this comment for git diff clarity.
 
 # ── API Endpoints ─────────────────────────────────────────────────────────────
 
@@ -2477,9 +2442,12 @@ async def save_custom_workflow(payload: dict = {}):
         "trigger":     payload.get("trigger", "manual"),
         "schedule":    payload.get("schedule", ""),
         "agents":      payload.get("agents", []),
-        "tables":      payload.get("tables", []),
+        "tables":       payload.get("tables", []),
         "table_checks": payload.get("table_checks", {}),
-        "branches":    payload.get("branches", []),
+        "branches":     payload.get("branches", []),
+        "schema_group": payload.get("schema_group", ""),
+        "db_key":       payload.get("db_key", "default"),
+        "slack_channel":payload.get("slack_channel", ""),
         "endpoint":    payload.get("endpoint", ""),
         "saved_at":    existing.get("saved_at", now),
         "updated_at":  now,
