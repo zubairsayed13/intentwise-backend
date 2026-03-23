@@ -2510,7 +2510,11 @@ async def custom_workflow_cron_check():
             continue
         if _cron_is_due(schedule, wf.get("last_run")):
             try:
-                result = await _run_custom_workflow(wf, triggered_by="cron")
+                # Use v2 runner (flat checks list) if available, else legacy
+                if wf.get("checks"):
+                    result = await _run_workflow_checks(wf, triggered_by="cron")
+                else:
+                    result = await _run_custom_workflow(wf, triggered_by="cron")
                 triggered.append({"id": wf_id, "name": wf["name"],
                                    "run_id": result["run_id"], "status": result["status"]})
             except Exception as e:
@@ -2658,6 +2662,9 @@ async def build_anomaly_baseline(payload: dict = {}):
         key = _baseline_key(schema, table)
         baseline = await asyncio.to_thread(_build_baseline, schema, table)
         _baselines[key] = baseline
+        # Persist baseline to Redshift
+        import threading as _thr
+        _thr.Thread(target=_save_baseline, args=(key, baseline), daemon=True).start()
         results.append({"table": t, "row_count": baseline.get("row_count"),
                          "columns_profiled": len(baseline.get("null_rates", {})),
                          "error": baseline.get("error")})
@@ -3165,6 +3172,10 @@ async def _gate_await(run_id: str, gate_num: int, timeout_min: int = None) -> st
     decision = _sop_gate_store[token].get("decision", "rejected")
     if run_id in _sop_runs:
         _sop_runs[run_id][f"gate{gate_num}_decision"] = decision
+        # Persist updated state
+        import threading as _thr3
+        state_snap = dict(_sop_runs[run_id])
+        _thr3.Thread(target=_save_sop_run, args=(run_id, state_snap), daemon=True).start()
     return decision
 
 
@@ -3182,6 +3193,10 @@ async def _run_sop(run_id: str, gate_timeout_min: int = None):
         state.update(d)
         if "trace_append" in d:
             append_trace(d.pop("trace_append"))
+        # Persist state snapshot after every step
+        import threading as _st
+        snap = {k:v for k,v in state.items() if not callable(v)}
+        _st.Thread(target=_save_sop_run, args=(run_id, snap), daemon=True).start()
 
     try:
         # ── Detection ─────────────────────────────────────────────────────────
@@ -3850,6 +3865,9 @@ async def run_evals(payload: dict = {}):
     }
 
     _eval_history.insert(0, run)
+    # Persist to Redshift in background
+    import threading as _thr2
+    _thr2.Thread(target=_save_eval_run, args=(run,), daemon=True).start()
     if len(_eval_history) > 100:
         _eval_history.pop()
 
@@ -4233,3 +4251,810 @@ async def delete_dashboard_widget(widget_id: str):
             conn.commit(); cur.close(); conn.close()
         except Exception: pass
         return {"deleted": True, "widget_id": widget_id}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VISUALIZATION DASHBOARDS
+# Self-serve BI: profile a table → auto-suggest charts → save named dashboards
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/viz/profile")
+def profile_table(schema: str = Query(...), table: str = Query(...),
+                  db_key: str = Query("default")):
+    """
+    Profile a table: column types, cardinalities, ranges, sample values.
+    Returns column metadata + chart suggestions.
+    """
+    import re as _re2
+    full = f"{schema}.{table}"
+    if not _re2.match(r'^[a-zA-Z0-9_]+$', schema) or not _re2.match(r'^[a-zA-Z0-9_]+$', table):
+        return {"error": "Invalid table name"}
+    try:
+        conn = get_connection(db_key)
+
+        # Row count
+        rc = q(conn, f"SELECT COUNT(*) AS cnt FROM {full}")
+        row_count = int(rc[0]["cnt"]) if rc else 0
+
+        # Column info from information_schema
+        cols = q(conn, """
+            SELECT column_name, data_type, ordinal_position
+            FROM information_schema.columns
+            WHERE table_schema=%s AND table_name=%s
+            ORDER BY ordinal_position
+        """, [schema, table])
+
+        TYPE_MAP = {
+            "integer":"numeric","bigint":"numeric","smallint":"numeric",
+            "numeric":"numeric","decimal":"numeric","real":"numeric",
+            "double precision":"numeric","float8":"numeric",
+            "character varying":"categorical","varchar":"categorical","text":"categorical","char":"categorical",
+            "boolean":"boolean",
+            "date":"date",
+            "timestamp":"datetime","timestamp without time zone":"datetime",
+            "timestamp with time zone":"datetime",
+        }
+
+        profile_cols = []
+        for col in cols:
+            cn   = col["column_name"]
+            dt   = col["data_type"].lower()
+            kind = TYPE_MAP.get(dt, "categorical")
+            info = {"name": cn, "data_type": dt, "kind": kind}
+
+            # For categorical: distinct count + top values
+            if kind == "categorical":
+                try:
+                    dist = q(conn, f'SELECT COUNT(DISTINCT "{cn}") AS cnt FROM {full}')
+                    info["distinct"] = int(dist[0]["cnt"]) if dist else 0
+                    if info["distinct"] <= 50:
+                        tops = q(conn, f'SELECT "{cn}" AS val, COUNT(*) AS cnt FROM {full} WHERE "{cn}" IS NOT NULL GROUP BY "{cn}" ORDER BY cnt DESC LIMIT 10')
+                        info["top_values"] = [{"val": str(r["val"]), "cnt": int(r["cnt"])} for r in tops]
+                except Exception: pass
+
+            # For numeric: min/max/avg
+            elif kind == "numeric":
+                try:
+                    stats = q(conn, f'SELECT MIN("{cn}") AS mn, MAX("{cn}") AS mx, AVG("{cn}") AS av FROM {full}')
+                    if stats:
+                        info["min"] = float(stats[0]["mn"] or 0)
+                        info["max"] = float(stats[0]["mx"] or 0)
+                        info["avg"] = round(float(stats[0]["av"] or 0), 2)
+                except Exception: pass
+
+            # For date/datetime: min/max
+            elif kind in ("date","datetime"):
+                try:
+                    dr = q(conn, f'SELECT MIN("{cn}")::text AS mn, MAX("{cn}")::text AS mx FROM {full}')
+                    if dr:
+                        info["min_date"] = dr[0]["mn"]
+                        info["max_date"] = dr[0]["mx"]
+                except Exception: pass
+
+            # Null rate
+            try:
+                nr = q(conn, f'SELECT COUNT(*) AS cnt FROM {full} WHERE "{cn}" IS NULL')
+                info["null_count"] = int(nr[0]["cnt"]) if nr else 0
+                info["null_pct"]   = round(info["null_count"] / max(row_count,1) * 100, 1)
+            except Exception: pass
+
+            profile_cols.append(info)
+
+        conn.close()
+
+        # ── Auto-suggest charts ───────────────────────────────────────────────
+        cats  = [c for c in profile_cols if c["kind"]=="categorical"]
+        nums  = [c for c in profile_cols if c["kind"]=="numeric"]
+        dates = [c for c in profile_cols if c["kind"] in ("date","datetime")]
+
+        suggestions = []
+        sid = 0
+        def sug(type_, title, sql, x, y, color="#6366f1", size="medium"):
+            nonlocal sid
+            sid += 1
+            return {"id":f"sug_{sid}","title":title,"type":type_,"sql":sql,
+                    "x_col":x,"y_col":y,"color":color,"size":size}
+
+        # Time series for each numeric × date
+        for d in dates[:1]:
+            for n in nums[:3]:
+                suggestions.append(sug(
+                    "area",
+                    f"{n['name']} over time",
+                    f'SELECT {d["name"]}::text AS "{d["name"]}", SUM("{n["name"]}") AS "{n["name"]}" FROM {full} WHERE "{d["name"]}" IS NOT NULL GROUP BY {d["name"]} ORDER BY {d["name"]} LIMIT 90',
+                    d["name"], n["name"], "#6366f1", "large"
+                ))
+
+        # Bar: categorical × numeric
+        for c in cats[:2]:
+            if c.get("distinct",999) <= 50:
+                for n in nums[:2]:
+                    suggestions.append(sug(
+                        "bar",
+                        f"{n['name']} by {c['name']}",
+                        f'SELECT "{c["name"]}", SUM("{n["name"]}") AS "{n["name"]}" FROM {full} WHERE "{c["name"]}" IS NOT NULL GROUP BY "{c["name"]}" ORDER BY "{n["name"]}" DESC LIMIT 20',
+                        c["name"], n["name"], "#0ea5e9", "medium"
+                    ))
+
+        # Donut: categorical with ≤15 distinct values
+        for c in cats[:2]:
+            if c.get("distinct",999) <= 15 and c.get("distinct",0) >= 2:
+                suggestions.append(sug(
+                    "donut",
+                    f"{c['name']} distribution",
+                    f'SELECT "{c["name"]}" AS label, COUNT(*) AS value FROM {full} WHERE "{c["name"]}" IS NOT NULL GROUP BY "{c["name"]}" ORDER BY value DESC LIMIT 15',
+                    "label", "value", "#8b5cf6", "medium"
+                ))
+
+        # KPI: numeric columns (sum/count)
+        for n in nums[:4]:
+            suggestions.append(sug(
+                "kpi",
+                f"Total {n['name']}",
+                f'SELECT SUM("{n["name"]}") AS value FROM {full}',
+                "", "value", "#10b981", "small"
+            ))
+
+        # Row count KPI
+        suggestions.append(sug("kpi","Total Rows",f"SELECT COUNT(*) AS value FROM {full}","","value","#f59e0b","small"))
+
+        # Table preview
+        suggestions.append(sug("table","Data Preview",f"SELECT * FROM {full} LIMIT 100","","","#6366f1","full"))
+
+        return {
+            "schema": schema, "table": table, "full_table": full,
+            "row_count": row_count, "column_count": len(profile_cols),
+            "columns": profile_cols,
+            "suggestions": suggestions[:12],  # cap at 12
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── Viz Dashboard Store ───────────────────────────────────────────────────────
+_viz_cache: dict = {}   # { dashboard_id: dashboard_dict }
+_viz_cache_loaded = False
+
+def _load_viz_dashboards(db_key="default"):
+    global _viz_cache, _viz_cache_loaded
+    try:
+        conn = get_connection(db_key)
+        try:
+            rows = q(conn, """
+                SELECT dashboard_id, dashboard_json
+                FROM wz_uploads._viz_dashboards
+                ORDER BY updated_at DESC
+            """)
+            conn.close()
+            _viz_cache = {r["dashboard_id"]: json.loads(r["dashboard_json"]) for r in rows}
+            _viz_cache_loaded = True
+            return list(_viz_cache.values())
+        except Exception:
+            conn.close()
+    except Exception: pass
+    _viz_cache_loaded = True
+    return []
+
+def _save_viz_to_db(dashboard: dict, db_key="default"):
+    try:
+        conn = get_connection(db_key)
+        cur  = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS wz_uploads._viz_dashboards (
+                dashboard_id   VARCHAR(64),
+                dashboard_json VARCHAR(65535),
+                updated_at     TIMESTAMP DEFAULT GETDATE()
+            )
+        """)
+        cur.execute("DELETE FROM wz_uploads._viz_dashboards WHERE dashboard_id = %s",
+                    [dashboard["id"]])
+        cur.execute("INSERT INTO wz_uploads._viz_dashboards (dashboard_id, dashboard_json) VALUES (%s, %s)",
+                    [dashboard["id"], json.dumps(dashboard)])
+        conn.commit(); cur.close(); conn.close()
+    except Exception: pass
+
+
+@app.get("/api/viz/dashboards")
+def list_viz_dashboards():
+    global _viz_cache_loaded
+    if not _viz_cache_loaded:
+        _load_viz_dashboards()
+    return {"dashboards": list(_viz_cache.values())}
+
+
+@app.post("/api/viz/dashboards")
+async def save_viz_dashboard(payload: dict = {}):
+    global _viz_cache
+    if not payload.get("id"):
+        payload["id"] = f"viz_{uuid.uuid4().hex[:8]}"
+    payload["updated_at"] = datetime.datetime.utcnow().isoformat()
+    _viz_cache[payload["id"]] = payload
+    _save_viz_to_db(payload)
+    return {"saved": True, "dashboard": payload}
+
+
+@app.delete("/api/viz/dashboards/{dashboard_id}")
+async def delete_viz_dashboard(dashboard_id: str):
+    global _viz_cache
+    _viz_cache.pop(dashboard_id, None)
+    try:
+        conn = get_connection()
+        cur  = conn.cursor()
+        cur.execute("DELETE FROM wz_uploads._viz_dashboards WHERE dashboard_id = %s",
+                    [dashboard_id])
+        conn.commit(); cur.close(); conn.close()
+    except Exception: pass
+    return {"deleted": dashboard_id}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WORKFLOW PERSISTENCE — save workflows + run history to Redshift
+# Survives Railway restarts. Loaded into memory cache on startup.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _ensure_wf_tables(conn):
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS wz_uploads._wf_registry (
+            wf_id        VARCHAR(64),
+            wf_json      VARCHAR(65535),
+            updated_at   TIMESTAMP DEFAULT GETDATE()
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS wz_uploads._wf_run_log (
+            run_id       VARCHAR(64),
+            wf_id        VARCHAR(64),
+            run_json     VARCHAR(65535),
+            started_at   TIMESTAMP DEFAULT GETDATE()
+        )
+    """)
+    conn.commit(); cur.close()
+
+def _persist_workflow(wf: dict, db_key: str = "default"):
+    try:
+        conn = get_connection(db_key)
+        _ensure_wf_tables(conn)
+        cur  = conn.cursor()
+        cur.execute("DELETE FROM wz_uploads._wf_registry WHERE wf_id=%s", [wf["id"]])
+        cur.execute("INSERT INTO wz_uploads._wf_registry (wf_id, wf_json) VALUES (%s,%s)",
+                    [wf["id"], json.dumps(wf)])
+        conn.commit(); cur.close(); conn.close()
+    except Exception as e:
+        pass  # don't crash if Redshift unavailable
+
+def _persist_run(run: dict, db_key: str = "default"):
+    try:
+        conn = get_connection(db_key)
+        _ensure_wf_tables(conn)
+        cur  = conn.cursor()
+        # keep only last 200 runs per workflow in DB
+        cur.execute("DELETE FROM wz_uploads._wf_run_log WHERE wf_id=%s AND run_id NOT IN (SELECT run_id FROM wz_uploads._wf_run_log WHERE wf_id=%s ORDER BY started_at DESC LIMIT 199)", [run["workflow_id"], run["workflow_id"]])
+        cur.execute("INSERT INTO wz_uploads._wf_run_log (run_id, wf_id, run_json) VALUES (%s,%s,%s)",
+                    [run["run_id"], run["workflow_id"], json.dumps(run)])
+        conn.commit(); cur.close(); conn.close()
+    except Exception:
+        pass
+
+def _load_workflows_from_db(db_key: str = "default"):
+    try:
+        conn = get_connection(db_key)
+        try:
+            _ensure_wf_tables(conn)
+            rows = q(conn, "SELECT wf_json FROM wz_uploads._wf_registry ORDER BY updated_at DESC")
+            conn.close()
+            for r in rows:
+                try:
+                    wf = json.loads(r["wf_json"])
+                    if wf.get("id") and wf["id"] not in _CUSTOM_WORKFLOWS:
+                        _CUSTOM_WORKFLOWS[wf["id"]] = wf
+                except Exception: pass
+        except Exception:
+            conn.close()
+    except Exception: pass
+
+def _load_run_history_from_db(wf_id: str = None, limit: int = 100, db_key: str = "default"):
+    try:
+        conn = get_connection(db_key)
+        try:
+            if wf_id:
+                rows = q(conn, "SELECT run_json FROM wz_uploads._wf_run_log WHERE wf_id=%s ORDER BY started_at DESC LIMIT %s", [wf_id, limit])
+            else:
+                rows = q(conn, "SELECT run_json FROM wz_uploads._wf_run_log ORDER BY started_at DESC LIMIT %s", [limit])
+            conn.close()
+            return [json.loads(r["run_json"]) for r in rows]
+        except Exception:
+            conn.close()
+            return []
+    except Exception:
+        return []
+
+# Patch save_custom_workflow to also persist to DB
+@app.post("/api/custom-workflows/save/v2")
+async def save_custom_workflow_v2(payload: dict = {}):
+    """
+    Save workflow with full SQL checks and persist to Redshift.
+    Body: {
+      id?, name, desc, schedule, checks: [{id, name, sql, pass_condition, severity}],
+      tables, enabled, slack_channel, db_key
+    }
+    checks is now a flat list on the workflow (not per-table) for simplicity.
+    """
+    wf_id   = payload.get("id") or uuid.uuid4().hex[:12]
+    now     = datetime.datetime.utcnow().isoformat()
+    existing = _CUSTOM_WORKFLOWS.get(wf_id, {})
+
+    # Normalise checks — ensure each has an id
+    checks = payload.get("checks", [])
+    for chk in checks:
+        if not chk.get("id"):
+            chk["id"] = uuid.uuid4().hex[:8]
+
+    wf = {
+        **existing,
+        "id":           wf_id,
+        "name":         payload.get("name", "Unnamed Workflow"),
+        "desc":         payload.get("desc", ""),
+        "schedule":     payload.get("schedule", "every 30 min"),
+        "trigger":      "scheduled",
+        "checks":       checks,                         # flat list of SQL checks
+        "tables":       payload.get("tables", []),
+        "enabled":      payload.get("enabled", True),
+        "slack_channel":payload.get("slack_channel", ""),
+        "db_key":       payload.get("db_key", "default"),
+        "schema_group": payload.get("schema_group", ""),
+        "agents":       payload.get("agents", []),
+        "branches":     payload.get("branches", []),
+        "table_checks": payload.get("table_checks", {}),
+        "saved_at":     existing.get("saved_at", now),
+        "updated_at":   now,
+        "last_run":     existing.get("last_run"),
+        "run_count":    existing.get("run_count", 0),
+    }
+    _CUSTOM_WORKFLOWS[wf_id] = wf
+    _persist_workflow(wf, wf.get("db_key","default"))
+    return {"saved": True, "id": wf_id, "workflow": wf}
+
+
+@app.get("/api/custom-workflows/history/v2")
+def custom_workflow_history_v2(wf_id: str = Query(None), limit: int = Query(100)):
+    """Return run history from memory + DB for a specific workflow or all."""
+    # Start from in-memory, supplement with DB
+    mem_runs = [r for r in _wf_run_history if not wf_id or r.get("workflow_id")==wf_id]
+    db_runs  = _load_run_history_from_db(wf_id=wf_id, limit=limit)
+    # Merge by run_id
+    seen = {r["run_id"] for r in mem_runs}
+    merged = mem_runs + [r for r in db_runs if r["run_id"] not in seen]
+    merged.sort(key=lambda r: r.get("started_at",""), reverse=True)
+    return merged[:limit]
+
+
+async def _run_workflow_checks(wf: dict, triggered_by: str = "manual") -> dict:
+    """
+    New check runner for v2 workflows — runs flat checks list.
+    Each check: {id, name, sql, pass_condition, severity}
+    pass_condition: "rows = 0" | "rows > 0" | "rows > N" | "value = N" | "value > N"
+    """
+    run_id  = f"cwf_{uuid.uuid4().hex[:8]}"
+    started = datetime.datetime.utcnow().isoformat()
+    db_key  = wf.get("db_key", "default")
+    checks  = wf.get("checks", [])
+
+    check_results = []
+    try:
+        conn = get_connection(db_key)
+        for chk in checks:
+            sql   = (chk.get("sql") or "").strip()
+            cond  = (chk.get("pass_condition") or "rows = 0").strip()
+            name  = chk.get("name", "Check")
+            sev   = chk.get("severity", "high")
+            chk_id = chk.get("id", uuid.uuid4().hex[:8])
+            if not sql:
+                continue
+            t0 = datetime.datetime.utcnow()
+            try:
+                cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+                cur.execute(sql)
+                rows_out = cur.fetchmany(50)
+                cols     = [d[0] for d in cur.description] if cur.description else []
+                cur.close()
+                row_dicts = [dict(r) for r in rows_out]
+                rc = len(row_dicts)
+                fv = list(row_dicts[0].values())[0] if row_dicts and row_dicts[0] else 0
+
+                # Evaluate pass condition
+                try:
+                    parts = cond.split()
+                    metric = parts[0]   # "rows" or "value"
+                    op     = parts[1]   # "=", ">", "<", ">=", "<="
+                    thresh = float(parts[2])
+                    actual = float(rc) if metric=="rows" else float(fv or 0)
+                    passed = eval(f"{actual} {op} {thresh}")
+                except Exception:
+                    passed = rc == 0  # safe default
+
+                ms = int((datetime.datetime.utcnow()-t0).total_seconds()*1000)
+                check_results.append({
+                    "id": chk_id, "name": name, "sql": sql,
+                    "pass_condition": cond, "severity": sev,
+                    "passed": passed, "row_count": rc,
+                    "sample_rows": row_dicts[:5], "columns": cols,
+                    "duration_ms": ms,
+                    "error": None,
+                })
+            except Exception as ex:
+                ms = int((datetime.datetime.utcnow()-t0).total_seconds()*1000)
+                check_results.append({
+                    "id": chk_id, "name": name, "sql": sql,
+                    "pass_condition": cond, "severity": sev,
+                    "passed": False, "row_count": 0,
+                    "sample_rows": [], "columns": [],
+                    "duration_ms": ms,
+                    "error": str(ex)[:200],
+                })
+        conn.close()
+    except Exception as e:
+        check_results.append({
+            "id": "conn_error", "name": "Connection", "passed": False,
+            "error": str(e)[:200], "row_count": 0, "columns": [], "sample_rows": []
+        })
+
+    failed = [c for c in check_results if not c["passed"]]
+    status = "clean" if not failed else "issues_found"
+    ended  = datetime.datetime.utcnow().isoformat()
+
+    run = {
+        "run_id":        run_id,
+        "workflow_id":   wf.get("id",""),
+        "workflow_name": wf.get("name",""),
+        "started_at":    started,
+        "ended_at":      ended,
+        "triggered_by":  triggered_by,
+        "status":        status,
+        "total_checks":  len(check_results),
+        "passed":        len([c for c in check_results if c["passed"]]),
+        "failed":        len(failed),
+        "check_results": check_results,
+        "duration_ms":   int((datetime.datetime.fromisoformat(ended)-datetime.datetime.fromisoformat(started)).total_seconds()*1000),
+    }
+
+    # Store in memory
+    _wf_run_history.insert(0, run)
+    if len(_wf_run_history) > 200: _wf_run_history.pop()
+
+    # Persist to DB async
+    import threading
+    threading.Thread(target=_persist_run, args=(run, db_key), daemon=True).start()
+
+    # Update workflow last_run
+    if wf.get("id") and wf["id"] in _CUSTOM_WORKFLOWS:
+        _CUSTOM_WORKFLOWS[wf["id"]]["last_run"] = started
+        _CUSTOM_WORKFLOWS[wf["id"]]["run_count"] = _CUSTOM_WORKFLOWS[wf["id"]].get("run_count",0) + 1
+
+    # Slack notification on failure
+    slack = wf.get("slack_channel") or os.getenv("SLACK_WEBHOOK_URL","")
+    if failed and slack:
+        try:
+            msg = f"⚠️ *{wf.get('name','')}* — {len(failed)}/{len(check_results)} checks failed\n"
+            msg += "\n".join(f"• `{c['name']}`: {c['error'] or c['pass_condition']}" for c in failed[:5])
+            import httpx as _httpx
+            import asyncio as _asyncio
+            async def _notify():
+                async with _httpx.AsyncClient(timeout=5) as cl:
+                    await cl.post(slack, json={"text": msg})
+            _asyncio.create_task(_notify())
+        except Exception: pass
+
+    return run
+
+
+@app.post("/api/custom-workflows/{wf_id}/run/v2")
+async def run_workflow_v2(wf_id: str):
+    """Run a v2 workflow by id — uses flat checks list."""
+    # Try memory first, then DB
+    wf = _CUSTOM_WORKFLOWS.get(wf_id)
+    if not wf:
+        db_wfs = _load_workflows_from_db()
+        wf = _CUSTOM_WORKFLOWS.get(wf_id)
+    if not wf:
+        return {"error": f"Workflow '{wf_id}' not found"}
+    if not wf.get("checks") and not wf.get("tables"):
+        return {"error": "Workflow has no checks configured"}
+    if wf.get("checks"):
+        return await _run_workflow_checks(wf, triggered_by="manual")
+    else:
+        return await _run_custom_workflow(wf, triggered_by="manual")
+
+
+@app.get("/api/custom-workflows/load-from-db")
+async def load_workflows_from_db_endpoint():
+    """Force-load workflows from Redshift into memory."""
+    _load_workflows_from_db()
+    return {"loaded": len(_CUSTOM_WORKFLOWS), "workflows": list(_CUSTOM_WORKFLOWS.keys())}
+
+
+# Override cron check to also run v2 workflows
+@app.post("/api/custom-workflows/cron-check/v2")
+async def custom_cron_v2():
+    """Check all enabled workflows and run those due."""
+    now = datetime.datetime.utcnow()
+    ran = []
+    for wf in list(_CUSTOM_WORKFLOWS.values()):
+        if not wf.get("enabled", True): continue
+        sched = wf.get("schedule","")
+        if not sched or not _cron_is_due(sched, now): continue
+        try:
+            if wf.get("checks"):
+                result = await _run_workflow_checks(wf, triggered_by="cron")
+            else:
+                result = await _run_custom_workflow(wf, triggered_by="cron")
+            ran.append({"wf_id":wf["id"],"wf_name":wf["name"],"status":result.get("status")})
+        except Exception as e:
+            ran.append({"wf_id":wf["id"],"wf_name":wf["name"],"status":"error","error":str(e)})
+    return {"ran": len(ran), "results": ran}
+
+
+# Load from DB on startup
+try:
+    _load_workflows_from_db()
+except Exception:
+    pass
+
+
+# ── Daily Brief run endpoint (was missing) ────────────────────────────────────
+@app.post("/api/workflow/daily-run")
+async def run_daily_workflow(payload: dict = {}):
+    """
+    Run the Daily Data Brief — scans mws.report for download, freshness,
+    and integrity issues. Returns structured results matching WorkflowDetail format.
+    """
+    run_id  = f"brief_{uuid.uuid4().hex[:8]}"
+    started = datetime.datetime.utcnow().isoformat()
+    db_key  = payload.get("db_key", "default")
+
+    checks_def = [
+        {"id":"brief_dl",    "name":"Failed Downloads",        "sql":"SELECT COUNT(*) FROM mws.report WHERE status='failed' AND download_date=(SELECT MAX(download_date) FROM mws.report)",         "pass_condition":"rows = 0", "severity":"high"},
+        {"id":"brief_stuck", "name":"Stuck Pending (>2h)",     "sql":"SELECT COUNT(*) FROM mws.report WHERE status='pending' AND download_date<(NOW()-INTERVAL '2 hours')",                          "pass_condition":"rows = 0", "severity":"high"},
+        {"id":"brief_copy",  "name":"Not Replicated",           "sql":"SELECT COUNT(*) FROM mws.report WHERE status='processed' AND (copy_status IS NULL OR copy_status='NOT_REPLICATED') AND download_date>=(SELECT MAX(download_date)-1 FROM mws.report)", "pass_condition":"rows = 0", "severity":"medium"},
+        {"id":"brief_fresh", "name":"Data Freshness",           "sql":"SELECT COUNT(*) FROM mws.report WHERE download_date=CURRENT_DATE",                                                            "pass_condition":"rows > 0", "severity":"critical"},
+        {"id":"brief_null",  "name":"Null Report Types",        "sql":"SELECT COUNT(*) FROM mws.report WHERE report_type IS NULL AND download_date=(SELECT MAX(download_date) FROM mws.report)",     "pass_condition":"rows = 0", "severity":"medium"},
+    ]
+
+    # Reuse the flat check runner
+    brief_wf = {
+        "id": "daily-brief", "name": "Daily Data Brief",
+        "checks": checks_def, "db_key": db_key,
+        "slack_channel": os.getenv("SLACK_WEBHOOK_URL", ""),
+    }
+    result = await _run_workflow_checks(brief_wf, triggered_by="manual")
+
+    # Store under daily-brief workflow_id for history
+    result["workflow_id"] = "daily-brief"
+    result["workflow_name"] = "Daily Data Brief"
+    return result
+
+
+# Startup: handled by _master_startup() at bottom of file
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# REDSHIFT PERSISTENCE — fill remaining in-memory gaps
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _ensure_storage_tables(conn):
+    """Create all wz_uploads staging tables needed for persistence."""
+    cur = conn.cursor()
+    stmts = [
+        """CREATE TABLE IF NOT EXISTS wz_uploads._schema (
+            table_key    VARCHAR(256),
+            data_json    VARCHAR(65535),
+            updated_at   TIMESTAMP DEFAULT GETDATE()
+        )""",
+        """CREATE TABLE IF NOT EXISTS wz_uploads._eval_history (
+            run_id       VARCHAR(64),
+            run_json     VARCHAR(65535),
+            created_at   TIMESTAMP DEFAULT GETDATE()
+        )""",
+        """CREATE TABLE IF NOT EXISTS wz_uploads._sop_runs (
+            run_id       VARCHAR(64),
+            run_json     VARCHAR(65535),
+            updated_at   TIMESTAMP DEFAULT GETDATE()
+        )""",
+    ]
+    for s in stmts:
+        try:
+            cur.execute(s)
+        except Exception:
+            pass
+    conn.commit()
+    cur.close()
+
+
+# ── Baselines (anomaly detection) ────────────────────────────────────────────
+def _save_baseline(table_key: str, baseline: dict, db_key: str = "default"):
+    try:
+        conn = get_connection(db_key)
+        _ensure_uploads_schema(conn)
+        _ensure_storage_tables(conn)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM wz_uploads._schema WHERE table_key=%s", [f"baseline:{table_key}"])
+        cur.execute("INSERT INTO wz_uploads._schema (table_key, data_json) VALUES (%s,%s)",
+                    [f"baseline:{table_key}", json.dumps(baseline)])
+        conn.commit(); cur.close(); conn.close()
+    except Exception: pass
+
+
+def _load_baselines(db_key: str = "default"):
+    global _baselines
+    try:
+        conn = get_connection(db_key)
+        try:
+            rows = q(conn, "SELECT table_key, data_json FROM wz_uploads._schema WHERE table_key LIKE 'baseline:%'")
+            conn.close()
+            for r in rows:
+                key = r["table_key"].replace("baseline:", "")
+                _baselines[key] = json.loads(r["data_json"])
+        except Exception:
+            conn.close()
+    except Exception: pass
+
+
+# ── Eval history ─────────────────────────────────────────────────────────────
+def _save_eval_run(run: dict, db_key: str = "default"):
+    try:
+        conn = get_connection(db_key)
+        _ensure_uploads_schema(conn)
+        _ensure_storage_tables(conn)
+        cur = conn.cursor()
+        # Keep last 50 in DB
+        cur.execute("DELETE FROM wz_uploads._eval_history WHERE run_id NOT IN (SELECT run_id FROM wz_uploads._eval_history ORDER BY created_at DESC LIMIT 49)")
+        cur.execute("INSERT INTO wz_uploads._eval_history (run_id, run_json) VALUES (%s,%s)",
+                    [run.get("run_id", uuid.uuid4().hex[:8]), json.dumps(run)])
+        conn.commit(); cur.close(); conn.close()
+    except Exception: pass
+
+
+def _load_eval_history(db_key: str = "default"):
+    global _eval_history
+    try:
+        conn = get_connection(db_key)
+        try:
+            rows = q(conn, "SELECT run_json FROM wz_uploads._eval_history ORDER BY created_at DESC LIMIT 50")
+            conn.close()
+            _eval_history = [json.loads(r["run_json"]) for r in rows]
+        except Exception:
+            conn.close()
+    except Exception: pass
+
+
+# ── SOP runs ─────────────────────────────────────────────────────────────────
+def _save_sop_run(run_id: str, state: dict, db_key: str = "default"):
+    """Persist SOP run state (snapshot) — called after each gate/step."""
+    try:
+        # Strip threading.Event objects which aren't serialisable
+        safe = {k: v for k, v in state.items() if k != "gate_events"}
+        conn = get_connection(db_key)
+        _ensure_uploads_schema(conn)
+        _ensure_storage_tables(conn)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM wz_uploads._sop_runs WHERE run_id=%s", [run_id])
+        cur.execute("INSERT INTO wz_uploads._sop_runs (run_id, run_json) VALUES (%s,%s)",
+                    [run_id, json.dumps(safe, default=str)])
+        conn.commit(); cur.close(); conn.close()
+    except Exception: pass
+
+
+def _load_sop_runs(db_key: str = "default"):
+    global _sop_runs, _sop_today_run
+    try:
+        conn = get_connection(db_key)
+        try:
+            rows = q(conn, "SELECT run_json FROM wz_uploads._sop_runs ORDER BY updated_at DESC LIMIT 20")
+            conn.close()
+            for r in rows:
+                try:
+                    state = json.loads(r["run_json"])
+                    rid = state.get("run_id")
+                    if rid:
+                        _sop_runs[rid] = state
+                        # Mark today's run
+                        import datetime as _dt
+                        if state.get("started_at", "")[:10] == _dt.date.today().isoformat():
+                            _sop_today_run = rid
+                except Exception: pass
+        except Exception:
+            conn.close()
+    except Exception: pass
+
+
+# ── Master startup loader ─────────────────────────────────────────────────────
+@app.on_event("startup")
+async def _master_startup():
+    """Load ALL persisted state from Redshift on startup."""
+    import asyncio as _asyncio
+
+    def _load_all():
+        try: _load_workflows_from_db()
+        except Exception: pass
+        try: _load_baselines()
+        except Exception: pass
+        try: _load_eval_history()
+        except Exception: pass
+        try: _load_sop_runs()
+        except Exception: pass
+
+    # Run in thread to avoid blocking startup
+    import threading
+    t = threading.Thread(target=_load_all, daemon=True)
+    t.start()
+
+
+# ── Patch existing endpoints to persist after write ──────────────────────────
+# Patch _run_workflow_checks to persist run immediately
+_original_run_checks = _run_workflow_checks
+
+async def _run_workflow_checks_persistent(wf: dict, triggered_by: str = "manual") -> dict:
+    result = await _original_run_checks(wf, triggered_by)
+    # Already persisted in _persist_run via background thread inside _run_workflow_checks
+    return result
+
+_run_workflow_checks = _run_workflow_checks_persistent
+
+
+# Patch baseline endpoints to save after update
+@app.post("/api/anomaly/baseline/v2")
+async def build_baseline_persistent(payload: dict = {}):
+    """Build anomaly baseline and persist to Redshift."""
+    # Call the original baseline builder
+    from fastapi.testclient import TestClient  # just reuse logic
+    tables = payload.get("tables", [])
+    db_key = payload.get("db_key", "default")
+    result = {}
+    for tbl in tables:
+        parts = tbl.split(".", 1)
+        sc, tb = (parts[0], parts[1]) if len(parts)==2 else ("mws", parts[0])
+        try:
+            conn = get_connection(db_key)
+            # Row count baseline (last 14 days)
+            rc_rows = q(conn, f"""
+                SELECT COUNT(*) as cnt FROM {tbl}
+                WHERE download_date >= CURRENT_DATE - 14
+            """)
+            date_col = None
+            try:
+                dc = q(conn, f"""SELECT column_name FROM information_schema.columns
+                    WHERE table_schema='{sc}' AND table_name='{tb}'
+                    AND data_type IN ('date','timestamp','timestamp without time zone') LIMIT 1""")
+                if dc: date_col = dc[0]["column_name"]
+            except Exception: pass
+
+            b = {"row_count": {"mean": int(rc_rows[0]["cnt"]) // 14 if rc_rows else 0, "std": 0},
+                 "date_col": date_col, "tables": tbl}
+            _baselines[tbl] = b
+            _save_baseline(tbl, b, db_key)
+            result[tbl] = {"status": "ok", "baseline": b}
+            conn.close()
+        except Exception as e:
+            result[tbl] = {"status": "error", "error": str(e)}
+    return {"baselines_built": len(result), "results": result}
+
+
+@app.get("/api/anomaly/baselines")
+def get_baselines():
+    """Return all current baselines."""
+    return {"baselines": _baselines}
+
+
+# Patch eval history to persist
+_original_eval_run = None
+
+@app.post("/api/evals/run/v2")
+async def run_evals_persistent(payload: dict = {}):
+    """Run evals and persist results to Redshift."""
+    # Reuse existing eval run logic
+    from fastapi import Request
+    result = await run_eval_suite(payload)
+    if isinstance(result, dict) and result.get("run_id"):
+        import threading
+        threading.Thread(target=_save_eval_run, args=(result,), daemon=True).start()
+    return result
