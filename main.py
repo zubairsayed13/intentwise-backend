@@ -6,7 +6,31 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI()
+async def _background_scheduler():
+    """
+    Internal scheduler — runs every 60s inside the backend process.
+    Fires custom workflow cron checks and SOP auto-trigger.
+    No external cron service needed.
+    """
+    import asyncio as _asyncio
+    while True:
+        await _asyncio.sleep(60)
+        try:
+            await custom_workflow_cron_check()
+        except Exception:
+            pass
+        try:
+            await sop_auto_trigger({})
+        except Exception:
+            pass
+
+async def lifespan(app):
+    import asyncio as _asyncio
+    task = _asyncio.create_task(_background_scheduler())
+    yield
+    task.cancel()
+
+app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 def get_connection():
@@ -2092,45 +2116,72 @@ def wizi_agent_status(token: str):
 
 def _cron_is_due(cron_expr: str, last_run_iso: str | None) -> bool:
     """
-    Simple cron check: parse 'HH:MM' or '0 11 * * *' style.
-    Returns True if the workflow should fire now (within a 10-min window,
-    and hasn't already run in the past 50 minutes).
+    Supports:
+      "HH:MM IST" / "H:MM AM/PM IST" — daily at that IST time (2-min window)
+      "every N min"                   — every N minutes (for testing)
+      "every N hour"                  — every N hours
+      "0 11 * * *"                    — standard 5-part cron (UTC)
+    Skips if already ran within the last interval.
     """
     now = datetime.datetime.utcnow()
-    # If ran recently, skip
+    expr = cron_expr.strip().lower()
+
+    # ── "every N min/hour" — test-friendly interval schedule ──────────────
+    import re as _re2
+    m = _re2.match(r'every\s+(\d+)\s*(min|minute|minutes|hour|hours|hr)', expr)
+    if m:
+        n     = int(m.group(1))
+        unit  = m.group(2)
+        secs  = n * 3600 if unit.startswith("h") else n * 60
+        if last_run_iso:
+            try:
+                last = datetime.datetime.fromisoformat(last_run_iso)
+                elapsed = (now - last).total_seconds()
+                return elapsed >= secs
+            except Exception:
+                pass
+        return True  # never ran — fire now
+
+    # ── If ran in last 55 min, skip (prevents double-fire on time-of-day schedules)
     if last_run_iso:
         try:
             last = datetime.datetime.fromisoformat(last_run_iso)
-            if (now - last).total_seconds() < 50 * 60:
+            if (now - last).total_seconds() < 55 * 60:
                 return False
         except Exception:
             pass
 
-    # Support "HH:MM IST" style (subtract 5:30 to convert to UTC)
+    # ── Standard 5-part cron (UTC) ────────────────────────────────────────
     try:
         parts = cron_expr.strip().split()
         if len(parts) == 5:
-            # standard cron: minute hour * * *
             minute = int(parts[0])
             hour   = int(parts[1])
-        else:
-            # "4:30 PM IST" style
-            time_str = parts[0] if len(parts) >= 1 else cron_expr
-            ampm = parts[1].upper() if len(parts) > 1 else ""
-            h, m = map(int, time_str.replace("PM","").replace("AM","").strip().split(":"))
-            if "PM" in ampm and h != 12:
-                h += 12
-            # Convert IST (UTC+5:30) to UTC
-            total_min = h * 60 + m - 330
-            if total_min < 0:
-                total_min += 1440
-            hour   = total_min // 60
-            minute = total_min % 60
+            target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            return abs((now - target).total_seconds()) <= 120  # 2-min window
+    except Exception:
+        pass
 
-        # Fire if within 10-minute window
-        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        diff   = abs((now - target).total_seconds())
-        return diff <= 600  # 10-min window
+    # ── "HH:MM [AM/PM] [IST/UTC]" ─────────────────────────────────────────
+    try:
+        upper = cron_expr.strip().upper()
+        parts = upper.split()
+        time_str = parts[0]
+        ampm = next((p for p in parts[1:] if p in ("AM","PM")), "")
+        is_ist = "IST" in upper
+
+        h, mn = map(int, time_str.replace("AM","").replace("PM","").strip().split(":"))
+        if ampm == "PM" and h != 12: h += 12
+        if ampm == "AM" and h == 12: h = 0
+
+        if is_ist:
+            total_min = h * 60 + mn - 330
+            if total_min < 0: total_min += 1440
+            h  = total_min // 60
+            mn = total_min % 60
+
+        target = now.replace(hour=h, minute=mn, second=0, microsecond=0)
+        return abs((now - target).total_seconds()) <= 120  # 2-min window
     except Exception:
         return False
 
@@ -2794,7 +2845,8 @@ async def slack_slash_command(request):
 #       gate3 → refresh → gate4 → resume_copy → gate5 → finalize
 # ═══════════════════════════════════════════════════════════════════════════════
 
-import pytz
+# IST timezone offset (+5:30) — using stdlib only, no pytz dependency
+_IST_OFFSET = __import__("datetime").timezone(__import__("datetime").timedelta(hours=5, minutes=30))
 
 # ── Config ────────────────────────────────────────────────────────────────────
 SOP_TRIGGER_TIME_IST = os.getenv("SOP_TRIGGER_TIME", "16:00")   # 4:00 PM IST default
@@ -2841,8 +2893,7 @@ def _ts():
     return datetime.datetime.utcnow().strftime("%H:%M:%S")
 
 def _ist_now():
-    ist = pytz.timezone("Asia/Kolkata")
-    return datetime.datetime.now(ist)
+    return datetime.datetime.now(_IST_OFFSET)
 
 def _ist_past_time(time_str_ist: str) -> bool:
     """Check if current IST time is past a given HH:MM string."""
