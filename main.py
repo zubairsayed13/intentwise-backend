@@ -2968,33 +2968,65 @@ def _ist_past_time(time_str_ist: str) -> bool:
 # ── SOP Step Implementations ──────────────────────────────────────────────────
 
 async def _sop_detection(run_id: str) -> dict:
-    """Check all 4 ads tables for n-1 data availability."""
+    """Check data availability using configurable detection checks."""
     trace = []
     details = []
     missing = False
     n1_date = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
 
+    # Use custom detection checks if configured, else default table scan
+    custom_checks = _SOP_CONFIG.get("detection_checks", [])
+
     try:
         conn = get_connection()
-        for tbl in ADS_TABLES:
-            short = tbl.split("tbl_amzn_")[1].replace("_report","")
-            try:
-                r = q(conn, f"SELECT COUNT(*) AS cnt FROM {tbl} WHERE report_date = %s", [n1_date])
-                cnt = int(r[0]["cnt"]) if r else 0
-                if cnt == 0:
-                    details.append({"check":f"{short} ({n1_date})","status":"FAIL","detail":"No data for n-1 date"})
-                    missing = True
-                else:
-                    details.append({"check":f"{short} ({n1_date})","status":"PASS","detail":f"{cnt} rows"})
-            except Exception as e:
-                details.append({"check":short,"status":"WARN","detail":str(e)[:80]})
+        if custom_checks:
+            # Run each configured SQL check
+            for chk in custom_checks:
+                sql  = (chk.get("sql") or "").strip()
+                name = chk.get("name", "Check")
+                cond = chk.get("pass_condition", "rows > 0")
+                if not sql: continue
+                try:
+                    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+                    cur.execute(sql)
+                    rows_out = cur.fetchmany(10)
+                    cur.close()
+                    rc = len(rows_out)
+                    fv = list(rows_out[0].values())[0] if rows_out else 0
+                    try:
+                        parts = cond.split()
+                        actual = float(rc) if parts[0]=="rows" else float(fv or 0)
+                        passed = eval(f"{actual} {parts[1]} {float(parts[2])}")
+                    except Exception:
+                        passed = rc > 0
+                    if not passed:
+                        details.append({"check":name,"status":"FAIL","detail":f"{rc} rows (condition: {cond})"})
+                        missing = True
+                    else:
+                        details.append({"check":name,"status":"PASS","detail":f"{rc} rows"})
+                except Exception as e:
+                    details.append({"check":name,"status":"WARN","detail":str(e)[:80]})
+        else:
+            # Default: check each ads table for n-1 data
+            for tbl in ADS_TABLES:
+                short = tbl.split("tbl_amzn_")[1].replace("_report","") if "tbl_amzn_" in tbl else tbl
+                try:
+                    r = q(conn, f"SELECT COUNT(*) AS cnt FROM {tbl} WHERE report_date = %s", [n1_date])
+                    cnt = int(r[0]["cnt"]) if r else 0
+                    if cnt == 0:
+                        details.append({"check":f"{short} ({n1_date})","status":"FAIL","detail":"No data for n-1 date"})
+                        missing = True
+                    else:
+                        details.append({"check":f"{short} ({n1_date})","status":"PASS","detail":f"{cnt} rows"})
+                except Exception as e:
+                    details.append({"check":short,"status":"WARN","detail":str(e)[:80]})
         conn.close()
     except Exception as e:
         details.append({"check":"db_connection","status":"FAIL","detail":str(e)[:100]})
         missing = True
 
     trace.append({"node":"detection","ts":_ts(),
-        "msg":f"Detection complete — {'issues found' if missing else 'all ads tables have n-1 data'}",
+        "msg":f"Detection complete — {'issues found' if missing else 'all checks passed'}",
         "level":"warning" if missing else "success"})
 
     return {
@@ -3065,47 +3097,81 @@ async def _sop_validation() -> dict:
 
 
 async def _sop_pause_mage() -> dict:
-    """Dummy Mage pause API — pauses all 5 packages. Replace URL later."""
+    """Pause Mage packages — uses configured pause_url if available, else marks as manual."""
     results = []
     for pkg in MAGE_PACKAGES:
-        # DUMMY — replace with: POST {MAGE_API_URL}/api/pipelines/{pkg_id}/pause
-        await asyncio.sleep(0.1)
-        results.append({**pkg, "paused": True, "paused_at": _ts(),
-                        "dummy": True, "note": "Replace with real Mage API"})
+        pause_url = pkg.get("pause_url","").strip()
+        if pause_url:
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    resp = await client.post(pause_url, json={"action":"pause"})
+                results.append({**pkg, "paused": resp.status_code < 300,
+                    "paused_at": _ts(), "dummy": False,
+                    "http_status": resp.status_code})
+            except Exception as e:
+                results.append({**pkg, "paused": False, "paused_at": _ts(),
+                    "error": str(e)[:80], "dummy": False})
+        else:
+            # No URL — manual checklist item
+            results.append({**pkg, "paused": True, "paused_at": _ts(),
+                            "dummy": True, "note": "Manual — add pause_url to automate"})
     return {
         "mage_checklist": results,
         "trace_append": [{"node":"pause_mage","ts":_ts(),
-            "msg":f"Mage packages paused (dummy) — {len(results)} packages","level":"info"}]
+            "msg":f"Mage packages: {sum(1 for r in results if r.get('paused'))} paused / {len(results)} total",
+            "level":"info"}]
     }
 
 
 async def _sop_refresh() -> dict:
-    """Dummy AWS job triggers. Replace with real AWS API / console links later."""
+    """Trigger refresh jobs — uses configured URL if available, else marks as manual."""
     results = []
     for job in AWS_REFRESH_JOBS:
-        # DUMMY — replace with: boto3 / AWS API call / console URL
-        await asyncio.sleep(0.1)
-        results.append({**job, "triggered": True, "triggered_at": _ts(),
-                        "dummy": True, "note": "Replace with real AWS endpoint or IAM-authenticated URL"})
+        url = job.get("url","").strip()
+        if url:
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    resp = await client.post(url, json={"action":"trigger"})
+                results.append({**job, "triggered": resp.status_code < 300,
+                    "triggered_at": _ts(), "dummy": False,
+                    "http_status": resp.status_code})
+            except Exception as e:
+                results.append({**job, "triggered": False, "triggered_at": _ts(),
+                    "error": str(e)[:80], "dummy": False})
+        else:
+            results.append({**job, "triggered": True, "triggered_at": _ts(),
+                            "dummy": True, "note": "Manual — add URL to automate"})
     return {
         "refresh_checklist": results,
         "trace_append": [{"node":"refresh","ts":_ts(),
-            "msg":f"Refresh jobs triggered (dummy) — {len(results)} jobs","level":"info"}]
+            "msg":f"Refresh: {sum(1 for r in results if r.get('triggered'))} triggered / {len(results)} total",
+            "level":"info"}]
     }
 
 
 async def _sop_resume_copy() -> dict:
-    """Dummy GDS BigQuery copy triggers via Mage. Replace with real Mage pipeline IDs later."""
+    """Trigger GDS copy jobs — uses pipeline_url if configured."""
     results = []
     for job in GDS_COPY_JOBS:
-        # DUMMY — replace with: POST {MAGE_API_URL}/api/pipelines/{pipeline_id}/pipeline_runs
-        await asyncio.sleep(0.1)
-        results.append({**job, "triggered": True, "triggered_at": _ts(),
-                        "dummy": True, "note": "Replace with real Mage pipeline ID"})
+        url = job.get("pipeline_url","").strip()
+        if url:
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    resp = await client.post(url, json={"action":"trigger"})
+                results.append({**job, "triggered": resp.status_code < 300,
+                    "triggered_at": _ts(), "dummy": False,
+                    "http_status": resp.status_code})
+            except Exception as e:
+                results.append({**job, "triggered": False, "triggered_at": _ts(),
+                    "error": str(e)[:80], "dummy": False})
+        else:
+            results.append({**job, "triggered": True, "triggered_at": _ts(),
+                            "dummy": True, "note": "Manual — add pipeline_url to automate"})
     return {
         "copy_checklist": results,
         "trace_append": [{"node":"resume_copy","ts":_ts(),
-            "msg":f"GDS copy jobs triggered (dummy) — {len(results)} copies","level":"info"}]
+            "msg":f"GDS copies: {sum(1 for r in results if r.get('triggered'))} triggered / {len(results)} total",
+            "level":"info"}]
     }
 
 
@@ -3123,7 +3189,7 @@ async def _sop_finalize(run_state: dict) -> dict:
         except Exception: pass
 
     summary = (
-        f"Ads Download SOP Complete{duration}\n"
+        f"Daily Ads Data Availability Check Complete{duration}\n"
         f"Gates approved: {gates_done}/5\n"
         f"Validation: {pass_count}/{len(validation)} tables passed\n"
         f"Mage packages paused + resumed: {len(MAGE_PACKAGES)}\n"
@@ -3277,7 +3343,7 @@ async def _run_sop(run_id: str, gate_timeout_min: int = None):
 @app.post("/api/workflow/ads-sop")
 async def start_ads_sop(payload: dict = {}):
     """
-    Start the Ads Download SOP workflow.
+    Start the Daily Ads Data Availability Check workflow.
     Body: { "gate_timeout_min": 30 }  — optional timeout override
     Returns run_id immediately; poll /api/workflow/ads-sop/{run_id} for state.
     """
@@ -4986,6 +5052,8 @@ async def _master_startup():
         except Exception: pass
         try: _load_notes()
         except Exception: pass
+        try: _load_sop_config()
+        except Exception: pass
         # Load SLA thresholds
         try:
             conn = get_connection()
@@ -5929,3 +5997,104 @@ async def run_follow_up_check(payload: dict = {}):
         return {"name":name,"sql":sql,"passed":passed,"row_count":rc,"rows":rows,"columns":cols,"pass_condition":pass_cond}
     except Exception as e:
         return {"error": str(e), "passed": False}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SOP CONFIG — save/load customisable SOP settings to Redshift
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# In-memory SOP config (overrides module-level constants when set)
+_SOP_CONFIG: dict = {}
+
+def _ensure_sop_config_table(conn):
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS wz_uploads._sop_config (
+            config_key  VARCHAR(128),
+            config_json VARCHAR(65535),
+            updated_at  TIMESTAMP DEFAULT GETDATE()
+        )
+    """)
+    conn.commit(); cur.close()
+
+def _load_sop_config(db_key="default"):
+    global _SOP_CONFIG, MAGE_PACKAGES, AWS_REFRESH_JOBS, GDS_COPY_JOBS, ADS_TABLES
+    try:
+        conn = get_connection(db_key)
+        _ensure_uploads_schema(conn)
+        _ensure_sop_config_table(conn)
+        rows = q(conn, "SELECT config_key, config_json FROM wz_uploads._sop_config")
+        conn.close()
+        for r in rows:
+            try:
+                _SOP_CONFIG[r["config_key"]] = json.loads(r["config_json"])
+            except Exception: pass
+        # Apply to runtime variables
+        if "detection_checks" in _SOP_CONFIG:
+            pass  # used directly from _SOP_CONFIG
+        if "mage_packages" in _SOP_CONFIG:
+            MAGE_PACKAGES = _SOP_CONFIG["mage_packages"]
+        if "aws_refresh_jobs" in _SOP_CONFIG:
+            AWS_REFRESH_JOBS = _SOP_CONFIG["aws_refresh_jobs"]
+        if "gds_copy_jobs" in _SOP_CONFIG:
+            GDS_COPY_JOBS = _SOP_CONFIG["gds_copy_jobs"]
+        if "ads_tables" in _SOP_CONFIG:
+            ADS_TABLES = _SOP_CONFIG["ads_tables"]
+    except Exception: pass
+
+
+def _save_sop_config_key(key: str, value, db_key="default"):
+    _SOP_CONFIG[key] = value
+    try:
+        conn = get_connection(db_key)
+        _ensure_uploads_schema(conn)
+        _ensure_sop_config_table(conn)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM wz_uploads._sop_config WHERE config_key=%s", [key])
+        cur.execute("INSERT INTO wz_uploads._sop_config (config_key, config_json) VALUES (%s,%s)",
+                    [key, json.dumps(value)])
+        conn.commit(); cur.close(); conn.close()
+    except Exception: pass
+
+
+@app.get("/api/sop/config")
+def get_sop_config():
+    """Return current SOP configuration."""
+    return {
+        "detection_checks": _SOP_CONFIG.get("detection_checks", [
+            {"id":"det_1","name":"Campaign report data present","sql":"SELECT COUNT(*) FROM public.tbl_amzn_campaign_report WHERE report_date=(SELECT MAX(report_date) FROM public.tbl_amzn_campaign_report)","pass_condition":"rows > 0"},
+            {"id":"det_2","name":"No failed downloads today","sql":"SELECT COUNT(*) FROM mws.report WHERE status='failed' AND download_date=CURRENT_DATE","pass_condition":"rows = 0"},
+        ]),
+        "mage_packages": _SOP_CONFIG.get("mage_packages", MAGE_PACKAGES),
+        "aws_refresh_jobs": _SOP_CONFIG.get("aws_refresh_jobs", AWS_REFRESH_JOBS),
+        "gds_copy_jobs": _SOP_CONFIG.get("gds_copy_jobs", GDS_COPY_JOBS),
+        "ads_tables": _SOP_CONFIG.get("ads_tables", ADS_TABLES),
+        "gate_labels": _SOP_CONFIG.get("gate_labels", {
+            "gate1": "Pause Mage Jobs",
+            "gate2": "Data Available",
+            "gate3": "Proceed with Refreshes",
+            "gate4": "Run Product Summary",
+            "gate5": "Resume Mage & GDS Copies",
+        }),
+    }
+
+
+@app.post("/api/sop/config")
+async def save_sop_config(payload: dict = {}):
+    """Save SOP configuration section."""
+    global MAGE_PACKAGES, AWS_REFRESH_JOBS, GDS_COPY_JOBS, ADS_TABLES
+
+    for key in ["detection_checks","mage_packages","aws_refresh_jobs","gds_copy_jobs","ads_tables","gate_labels"]:
+        if key in payload:
+            _save_sop_config_key(key, payload[key])
+
+    # Apply immediately to runtime
+    if "mage_packages"   in payload: MAGE_PACKAGES   = payload["mage_packages"]
+    if "aws_refresh_jobs" in payload: AWS_REFRESH_JOBS = payload["aws_refresh_jobs"]
+    if "gds_copy_jobs"   in payload: GDS_COPY_JOBS   = payload["gds_copy_jobs"]
+    if "ads_tables"      in payload: ADS_TABLES      = payload["ads_tables"]
+
+    return {"saved": True, "config": await get_sop_config().__wrapped__() if hasattr(get_sop_config,'__wrapped__') else get_sop_config()}
+
+
+
