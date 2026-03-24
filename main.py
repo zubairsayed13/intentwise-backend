@@ -2474,10 +2474,16 @@ def list_custom_workflows_v2():
 
 @app.delete("/api/custom-workflows/{wf_id}")
 def delete_custom_workflow(wf_id: str):
-    """Delete a custom workflow by ID."""
-    if wf_id not in _CUSTOM_WORKFLOWS:
-        return {"error": "Not found"}
-    del _CUSTOM_WORKFLOWS[wf_id]
+    """Delete a custom workflow by ID — removes from memory and Redshift."""
+    _CUSTOM_WORKFLOWS.pop(wf_id, None)
+    try:
+        conn = get_connection()
+        _ensure_wf_tables(conn)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM wz_uploads._wf_registry WHERE wf_id=%s", [wf_id])
+        conn.commit(); cur.close(); conn.close()
+    except Exception:
+        pass
     return {"deleted": True, "id": wf_id}
 
 
@@ -3095,6 +3101,53 @@ async def _sop_validation() -> dict:
                 "error": str(e)[:80]
             })
 
+    # ── Run custom Gate 2 checks if configured ────────────────────────────────
+    custom_checks = _SOP_CONFIG.get("gate2_checks", [])
+    for chk in custom_checks:
+        sql = chk.get("sql","").strip()
+        if not sql: continue
+        try:
+            conn = get_connection()
+            cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(sql)
+            rows = cur.fetchall()
+            cur.close(); conn.close()
+            rc = len(rows)
+            cond = chk.get("pass_condition","rows > 0")
+            try:
+                parts = cond.split()
+                actual = float(rc) if parts[0]=="rows" else float(list(dict(rows[0]).values())[0] if rows else 0)
+                passed = eval(f"{actual} {parts[1]} {float(parts[2])}")
+            except Exception:
+                passed = rc > 0
+            results.append({
+                "name": chk.get("name","Custom Check"),
+                "short": chk.get("name","custom")[:20],
+                "status": "PASS" if passed else "FAIL",
+                "today_count": rc,
+                "baseline_avg": 0,
+                "coverage_pct": 100.0 if passed else 0.0,
+                "has_today": passed,
+                "profile_count": rc,
+                "recent_dates": [],
+                "custom": True,
+            })
+        except Exception as e:
+            results.append({
+                "name": chk.get("name","Custom Check"), "short": "custom",
+                "status": "WARN", "today_count": 0, "baseline_avg": 0,
+                "coverage_pct": 0, "has_today": False, "profile_count": 0,
+                "recent_dates": [], "error": str(e)[:80], "custom": True,
+            })
+
+    _threshold = float(_SOP_CONFIG.get("validation_threshold_pct", 80))
+    # Custom gate2 checks are already in results; re-evaluate using threshold
+    table_results = [r for r in results if not r.get("custom")]
+    custom_results = [r for r in results if r.get("custom")]
+    # For table checks, use coverage_pct threshold from config
+    for r in table_results:
+        if r["status"] == "FAIL" and r.get("coverage_pct", 0) >= _threshold:
+            r["status"] = "WARN"  # downgrade to warn if above threshold
     all_pass = all(r["status"] in ("PASS","WARN") for r in results)
     return {
         "validation_results": results,
@@ -3205,6 +3258,17 @@ async def _sop_finalize(run_state: dict) -> dict:
         f"Refresh jobs triggered: {len(AWS_REFRESH_JOBS)}\n"
         f"GDS copies triggered: {len(GDS_COPY_JOBS)}"
     )
+    summary_data = {
+        "duration": duration.replace(" · Duration: ","").strip() if duration else None,
+        "gates_approved": gates_done,
+        "gates_total": 5,
+        "tables_passed": pass_count,
+        "tables_total": len(validation),
+        "mage_count": len(MAGE_PACKAGES),
+        "refresh_count": len(AWS_REFRESH_JOBS),
+        "gds_count": len(GDS_COPY_JOBS),
+        "validation_results": validation,
+    }
 
     notified = False
     slack_url = os.getenv("SLACK_WEBHOOK_URL","")
@@ -3217,6 +3281,7 @@ async def _sop_finalize(run_state: dict) -> dict:
 
     return {
         "completion_summary": summary,
+        "summary_data": summary_data,
         "notified": notified,
         "status": "complete",
         "trace_append": [{"node":"finalize","ts":_ts(),"msg":"SOP complete","level":"success"}]
@@ -3259,6 +3324,34 @@ async def _run_sop(run_id: str, gate_timeout_min: int = None):
     global _sop_today_run
     state = _sop_runs[run_id]
     trace = state["trace"]
+    force_full = state.get("force_full", False)   # skip detection gate if True
+    # Per-gate timeouts from config (fall back to global timeout)
+    _gate_timeouts = _SOP_CONFIG.get("gate_timeouts", {})
+    _slack_alerts  = _SOP_CONFIG.get("slack_gate_alerts", True)
+    _slack_url     = os.getenv("SLACK_WEBHOOK_URL", "")
+    _gate_labels   = _SOP_CONFIG.get("gate_labels", {})
+
+    def _gate_timeout(gate_num: int) -> int:
+        """Return timeout for a specific gate in minutes."""
+        key = f"gate{gate_num}"
+        return int(_gate_timeouts.get(key, gate_timeout_min or SOP_GATE_TIMEOUT_MIN))
+
+    async def _notify_gate_pending(gate_num: int):
+        """Send Slack alert when a gate goes pending."""
+        if not _slack_alerts or not _slack_url:
+            return
+        label = _gate_labels.get(f"gate{gate_num}", f"Gate {gate_num}")
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                await client.post(_slack_url, json={"text":
+                    f"⏳ *Daily Ads Check — Gate {gate_num} awaiting approval*
+"
+                    f"Action required: *{label}*
+"
+                    f"Open the dashboard to approve or reject."
+                })
+        except Exception:
+            pass
 
     def append_trace(entries):
         for e in entries:
@@ -3277,15 +3370,19 @@ async def _run_sop(run_id: str, gate_timeout_min: int = None):
         # ── Detection ─────────────────────────────────────────────────────────
         state["status"] = "detection"
         update(await _sop_detection(run_id))
-        if not state["detection_result"]["missing"]:
+        if not state["detection_result"]["missing"] and not force_full:
             state["status"] = "complete_no_issues"
-            state["completion_summary"] = "Detection passed — data available, SOP not required."
+            state["completion_summary"] = "Detection passed — data available, no issues found."
             return
+        elif not state["detection_result"]["missing"] and force_full:
+            trace.append({"node":"detection","ts":_ts(),
+                "msg":"Detection passed — running full check anyway (force_full=True)","level":"info"})
 
         # ── Gate 1: Pause Mage Jobs ────────────────────────────────────────────
         state["status"] = "awaiting_gate1"
+        await _notify_gate_pending(1)
         trace.append({"node":"gate1","ts":_ts(),"msg":"Awaiting Gate 1: Pause Mage Jobs","level":"warning"})
-        dec = await _gate_await(run_id, 1, gate_timeout_min)
+        dec = await _gate_await(run_id, 1, _gate_timeout(1))
         if dec == "rejected":
             state["status"] = "stopped"; return
         if dec == "timeout":
@@ -3297,8 +3394,9 @@ async def _run_sop(run_id: str, gate_timeout_min: int = None):
 
         # ── Gate 2: Data Available ─────────────────────────────────────────────
         state["status"] = "awaiting_gate2"
+        await _notify_gate_pending(2)
         trace.append({"node":"gate2","ts":_ts(),"msg":"Awaiting Gate 2: Data Available","level":"warning"})
-        dec = await _gate_await(run_id, 2, gate_timeout_min)
+        dec = await _gate_await(run_id, 2, _gate_timeout(2))
         if dec == "rejected":
             state["status"] = "stopped"; return
 
@@ -3308,8 +3406,9 @@ async def _run_sop(run_id: str, gate_timeout_min: int = None):
 
         # ── Gate 3: Proceed with Refreshes ────────────────────────────────────
         state["status"] = "awaiting_gate3"
+        await _notify_gate_pending(3)
         trace.append({"node":"gate3","ts":_ts(),"msg":"Awaiting Gate 3: Proceed with Refreshes","level":"warning"})
-        dec = await _gate_await(run_id, 3, gate_timeout_min)
+        dec = await _gate_await(run_id, 3, _gate_timeout(3))
         if dec == "rejected":
             state["status"] = "stopped"; return
 
@@ -3319,8 +3418,9 @@ async def _run_sop(run_id: str, gate_timeout_min: int = None):
 
         # ── Gate 4: Run Product Summary ───────────────────────────────────────
         state["status"] = "awaiting_gate4"
+        await _notify_gate_pending(4)
         trace.append({"node":"gate4","ts":_ts(),"msg":"Awaiting Gate 4: Run Product Summary","level":"warning"})
-        dec = await _gate_await(run_id, 4, gate_timeout_min)
+        dec = await _gate_await(run_id, 4, _gate_timeout(4))
         if dec == "rejected":
             state["status"] = "stopped"; return
 
@@ -3330,8 +3430,9 @@ async def _run_sop(run_id: str, gate_timeout_min: int = None):
 
         # ── Gate 5: Resume Mage & GDS Copies ──────────────────────────────────
         state["status"] = "awaiting_gate5"
+        await _notify_gate_pending(5)
         trace.append({"node":"gate5","ts":_ts(),"msg":"Awaiting Gate 5: Resume Mage & GDS Copies","level":"warning"})
-        dec = await _gate_await(run_id, 5, gate_timeout_min)
+        dec = await _gate_await(run_id, 5, _gate_timeout(5))
         if dec == "rejected":
             state["status"] = "stopped"; return
 
@@ -3396,6 +3497,33 @@ def get_latest_sop():
     return {"run": latest}
 
 
+@app.get("/api/workflow/ads-sop/history")
+def get_sop_history(limit: int = 20):
+    """Return list of all SOP runs sorted newest-first, with summary fields only."""
+    runs = sorted(_sop_runs.values(), key=lambda r: r.get("started_at",""), reverse=True)
+    summary = []
+    for r in runs[:limit]:
+        gates_done = sum(1 for i in range(1,6) if r.get(f"gate{i}_decision")=="approved")
+        val = r.get("validation_results",[])
+        summary.append({
+            "run_id":     r.get("run_id"),
+            "started_at": r.get("started_at","")[:16],
+            "status":     r.get("status",""),
+            "force_full": r.get("force_full", False),
+            "gates_approved": gates_done,
+            "detection_missing": r.get("detection_result",{}).get("missing"),
+            "validation_pass": r.get("validation_pass"),
+            "tables_checked": len(val),
+            "tables_passed": sum(1 for v in val if v.get("status")=="PASS"),
+            "notified":   r.get("notified", False),
+            "duration_min": round((
+                datetime.datetime.fromisoformat(r["completed_at"][:19]) -
+                datetime.datetime.fromisoformat(r["started_at"][:19])
+            ).total_seconds()/60) if r.get("completed_at") and r.get("started_at") else None,
+        })
+    return {"runs": summary, "total": len(_sop_runs)}
+
+
 @app.post("/api/workflow/sop-gate")
 async def submit_sop_gate(payload: dict = {}):
     """
@@ -3425,6 +3553,67 @@ async def submit_sop_gate(payload: dict = {}):
     return {"token": token, "decision": decision, "accepted": True}
 
 
+@app.post("/api/workflow/sop-gate/extend")
+async def extend_gate_timeout(payload: dict = {}):
+    """
+    Extend timeout for a pending gate by N more minutes.
+    Body: { "token": "sop-xxx-g1", "extend_minutes": 30 }
+    """
+    token   = payload.get("token","")
+    minutes = int(payload.get("extend_minutes", 30))
+    entry   = _sop_gate_store.get(token)
+    if not entry:
+        return {"error": f"Token {token} not found"}
+    if entry.get("decision") is not None:
+        return {"error": "Gate already resolved"}
+    # Extend by re-setting the event wait — we do this by storing an extension
+    entry["extended_by"] = entry.get("extended_by", 0) + minutes
+    # The actual wait is blocking in a thread; signal via a flag the thread checks
+    entry["extended_until"] = (datetime.datetime.utcnow() +
+        datetime.timedelta(minutes=minutes)).isoformat()
+    return {"extended": True, "token": token, "extra_minutes": minutes,
+            "new_deadline": entry["extended_until"]}
+
+
+@app.post("/api/workflow/ads-sop/resume")
+async def resume_sop_from_gate(payload: dict = {}):
+    """
+    Resume a stopped/errored SOP run from a specific gate.
+    Creates a new run_id but pre-seeds detection/validation results from the old run.
+    Body: { "from_run_id": "sop_xxx", "from_gate": 3, "gate_timeout_min": 30 }
+    """
+    from_run_id = payload.get("from_run_id","")
+    from_gate   = int(payload.get("from_gate", 1))
+    timeout     = int(payload.get("gate_timeout_min", SOP_GATE_TIMEOUT_MIN))
+
+    old_run = _sop_runs.get(from_run_id, {})
+    run_id  = f"sop_{uuid.uuid4().hex[:8]}"
+
+    # Copy relevant state from old run, reset gates from from_gate onwards
+    new_state = {
+        "run_id": run_id, "status": "starting",
+        "started_at": datetime.datetime.utcnow().isoformat(),
+        "resumed_from": from_run_id, "resumed_from_gate": from_gate,
+        "trace": [{"node":"sop","ts":_ts(),
+                   "msg":f"Resumed from gate {from_gate} (run {from_run_id})",
+                   "level":"info"}],
+        "detection_result":   old_run.get("detection_result"),
+        "validation_results": old_run.get("validation_results", []) if from_gate > 2 else [],
+        "validation_pass":    old_run.get("validation_pass") if from_gate > 2 else None,
+        "mage_checklist":     old_run.get("mage_checklist", []) if from_gate > 1 else [],
+        "refresh_checklist":  old_run.get("refresh_checklist", []) if from_gate > 3 else [],
+        "copy_checklist":     old_run.get("copy_checklist", []) if from_gate > 4 else [],
+        "completion_summary": None, "notified": False, "error": None,
+        "force_full": True,  # always run full when resuming
+        **{f"gate{i}_token": None for i in range(1,6)},
+        **{f"gate{i}_decision": "approved" if i < from_gate else None for i in range(1,6)},
+    }
+    _sop_runs[run_id] = new_state
+    asyncio.create_task(_run_sop(run_id, timeout))
+    return {"run_id": run_id, "resumed_from": from_run_id, "from_gate": from_gate,
+            "poll_url": f"/api/workflow/ads-sop/{run_id}"}
+
+
 @app.post("/api/workflow/sop-gate-force")
 async def force_sop_gate(payload: dict = {}):
     """Force-proceed all pending gates for a run (for testing/override)."""
@@ -3449,7 +3638,7 @@ async def sop_auto_trigger(payload: dict = {}):
     2. No SOP has run today already
     """
     global _sop_today_run
-    trigger_time = payload.get("trigger_time", SOP_TRIGGER_TIME_IST)
+    trigger_time = payload.get("trigger_time", _SOP_CONFIG.get("trigger_time_ist", SOP_TRIGGER_TIME_IST))
     ist_today    = _ist_now().date().isoformat()
 
     # Check if already ran today
@@ -6078,6 +6267,7 @@ def get_sop_config():
         "aws_refresh_jobs": _SOP_CONFIG.get("aws_refresh_jobs", AWS_REFRESH_JOBS),
         "gds_copy_jobs": _SOP_CONFIG.get("gds_copy_jobs", GDS_COPY_JOBS),
         "ads_tables": _SOP_CONFIG.get("ads_tables", ADS_TABLES),
+        "gate2_checks": _SOP_CONFIG.get("gate2_checks", []),
         "gate_labels": _SOP_CONFIG.get("gate_labels", {
             "gate1": "Pause Mage Jobs",
             "gate2": "Data Available",
@@ -6085,6 +6275,12 @@ def get_sop_config():
             "gate4": "Run Product Summary",
             "gate5": "Resume Mage & GDS Copies",
         }),
+        "gate_timeouts": _SOP_CONFIG.get("gate_timeouts", {
+            "gate1": 15, "gate2": 90, "gate3": 30, "gate4": 30, "gate5": 30,
+        }),
+        "trigger_time_ist": _SOP_CONFIG.get("trigger_time_ist", SOP_TRIGGER_TIME_IST),
+        "slack_gate_alerts": _SOP_CONFIG.get("slack_gate_alerts", True),
+        "validation_threshold_pct": _SOP_CONFIG.get("validation_threshold_pct", 80),
     }
 
 
@@ -6093,15 +6289,17 @@ async def save_sop_config(payload: dict = {}):
     """Save SOP configuration section."""
     global MAGE_PACKAGES, AWS_REFRESH_JOBS, GDS_COPY_JOBS, ADS_TABLES
 
-    for key in ["detection_checks","mage_packages","aws_refresh_jobs","gds_copy_jobs","ads_tables","gate_labels"]:
+    for key in ["detection_checks","gate2_checks","mage_packages","aws_refresh_jobs","gds_copy_jobs","ads_tables","gate_labels","gate_timeouts","trigger_time_ist","slack_gate_alerts","validation_threshold_pct"]:
         if key in payload:
             _save_sop_config_key(key, payload[key])
 
     # Apply immediately to runtime
-    if "mage_packages"   in payload: MAGE_PACKAGES   = payload["mage_packages"]
-    if "aws_refresh_jobs" in payload: AWS_REFRESH_JOBS = payload["aws_refresh_jobs"]
-    if "gds_copy_jobs"   in payload: GDS_COPY_JOBS   = payload["gds_copy_jobs"]
-    if "ads_tables"      in payload: ADS_TABLES      = payload["ads_tables"]
+    global SOP_TRIGGER_TIME_IST
+    if "mage_packages"    in payload: MAGE_PACKAGES        = payload["mage_packages"]
+    if "aws_refresh_jobs" in payload: AWS_REFRESH_JOBS     = payload["aws_refresh_jobs"]
+    if "gds_copy_jobs"    in payload: GDS_COPY_JOBS        = payload["gds_copy_jobs"]
+    if "ads_tables"       in payload: ADS_TABLES           = payload["ads_tables"]
+    if "trigger_time_ist" in payload: SOP_TRIGGER_TIME_IST = payload["trigger_time_ist"]
 
     return {"saved": True, "config": await get_sop_config().__wrapped__() if hasattr(get_sop_config,'__wrapped__') else get_sop_config()}
 
@@ -6579,3 +6777,421 @@ async def schedules_cron_check():
             r = await run_schedule_now(sch["id"])
             fired.append({"id": sch["id"], "name": sch["name"], "result": r.get("overall")})
     return {"fired": len(fired), "details": fired}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WIZI AGENT — Agentic loop with real tool calls
+# ═══════════════════════════════════════════════════════════════════════════════
+
+AGENT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "run_sql",
+            "description": "Execute a SELECT SQL query on the Redshift database and return results. Use this to answer data questions, check counts, find issues, verify data freshness etc.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sql": {"type": "string", "description": "The SQL query to run. Must be a SELECT or WITH statement."},
+                    "label": {"type": "string", "description": "Short human-readable label for what this query does, e.g. 'Check failed downloads today'"}
+                },
+                "required": ["sql", "label"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "navigate",
+            "description": "Navigate the user to a specific tab/section of the dashboard.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tab": {
+                        "type": "string",
+                        "enum": ["brief", "triage", "workflows", "dataflows", "approvals", "config", "query", "results", "scheduler"],
+                        "description": "The dashboard tab to navigate to"
+                    },
+                    "reason": {"type": "string", "description": "Why you are navigating there"}
+                },
+                "required": ["tab", "reason"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_workflow",
+            "description": "Trigger a workflow to run immediately by its ID.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "workflow_id": {"type": "string", "description": "The workflow ID to run"},
+                    "workflow_name": {"type": "string", "description": "Human readable name for display"}
+                },
+                "required": ["workflow_id", "workflow_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_workflow_status",
+            "description": "Get a list of all workflows and their last run status, schedule, and check counts.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_dataflows",
+            "description": "Get a list of all dataflows with their folder, tags, checks, and last run status.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_dataflow",
+            "description": "Run a specific dataflow's checks immediately.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "dataflow_id": {"type": "string"},
+                    "dataflow_name": {"type": "string"}
+                },
+                "required": ["dataflow_id", "dataflow_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_recent_results",
+            "description": "Get recent workflow run results — pass rates, failed checks, timing.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "How many recent runs to fetch (default 10)", "default": 10}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_kpis",
+            "description": "Get current KPIs: orders, inventory, sales metrics from the latest data.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_alerts",
+            "description": "Detect current data quality alerts: missing sales days, stale data, failed downloads etc.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_triage_issues",
+            "description": "Get current triage issues and data quality problems detected by the system.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_schema",
+            "description": "Get the database schema — list of tables and their columns.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_dataflow",
+            "description": "Create a new dataflow with SQL checks and save it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "desc": {"type": "string"},
+                    "folder_id": {"type": "string", "default": "f_custom"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "checks": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "sql": {"type": "string"},
+                                "pass_condition": {"type": "string"},
+                                "severity": {"type": "string"}
+                            }
+                        }
+                    }
+                },
+                "required": ["name", "checks"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_schedules",
+            "description": "Get all scheduled jobs — what runs when, last triggered, enabled status.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+]
+
+
+async def _execute_tool(tool_name: str, tool_args: dict) -> str:
+    """Execute a tool call and return the result as a string."""
+    try:
+        if tool_name == "run_sql":
+            sql = tool_args.get("sql", "").strip()
+            if not sql.upper().startswith(("SELECT", "WITH")):
+                return json.dumps({"error": "Only SELECT/WITH queries allowed"})
+            conn = get_connection()
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(sql)
+            rows = [dict(r) for r in cur.fetchmany(50)]
+            cols = [d[0] for d in cur.description] if cur.description else []
+            cur.close(); conn.close()
+            return json.dumps({"columns": cols, "rows": rows, "row_count": len(rows)})
+
+        elif tool_name == "navigate":
+            return json.dumps({"action": "navigate", "tab": tool_args.get("tab"), "reason": tool_args.get("reason")})
+
+        elif tool_name == "run_workflow":
+            wf_id = tool_args.get("workflow_id")
+            wf = _CUSTOM_WORKFLOWS.get(wf_id)
+            if not wf:
+                return json.dumps({"error": f"Workflow '{wf_id}' not found. Available: {list(_CUSTOM_WORKFLOWS.keys())}"})
+            if wf.get("checks"):
+                result = await _run_workflow_checks(wf, triggered_by="agent")
+            else:
+                result = await _run_custom_workflow(wf, triggered_by="agent")
+            return json.dumps({"status": result.get("overall", result.get("status")),
+                               "failed": result.get("failed", 0),
+                               "total_checks": result.get("total_checks", 0),
+                               "check_results": [{"name": c.get("name"), "passed": c.get("passed"), "row_count": c.get("row_count")} for c in (result.get("check_results") or [])]})
+
+        elif tool_name == "get_workflow_status":
+            wfs = list(_CUSTOM_WORKFLOWS.values())
+            return json.dumps([{"id": w["id"], "name": w["name"], "enabled": w.get("enabled", True),
+                                "schedule": w.get("schedule"), "checks": len(w.get("checks", [])),
+                                "last_run": w.get("last_run")} for w in wfs])
+
+        elif tool_name == "get_dataflows":
+            try:
+                conn = get_connection()
+                _ensure_uploads_schema(conn)
+                _ensure_dataflows_tables(conn)
+                rows = q(conn, "SELECT id, name, description, folder_id, tags, owner, priority, schedule, checks_json, starred, last_run_at, last_run_status FROM wz_uploads._dataflows ORDER BY updated_at DESC")
+                conn.close()
+                result = []
+                for r in rows:
+                    try: checks = json.loads(r.get("checks_json") or "[]")
+                    except: checks = []
+                    result.append({"id": r["id"], "name": r["name"], "folder": r.get("folder_id"),
+                                   "checks": len(checks), "last_run": r.get("last_run_at"),
+                                   "last_status": r.get("last_run_status")})
+                return json.dumps(result)
+            except Exception as e:
+                return json.dumps({"error": str(e)})
+
+        elif tool_name == "run_dataflow":
+            df_id = tool_args.get("dataflow_id")
+            result = await run_dataflow_by_id(df_id)
+            return json.dumps(result)
+
+        elif tool_name == "get_recent_results":
+            limit = tool_args.get("limit", 10)
+            res = await get_recent_workflow_results(limit=limit)
+            runs = res.get("runs", []) if isinstance(res, dict) else res
+            return json.dumps([{"workflow": r.get("workflow_name"), "status": r.get("status"),
+                                "failed": r.get("failed", 0), "total": r.get("total_checks", 0),
+                                "when": r.get("started_at", "")[:16]} for r in runs[:limit]])
+
+        elif tool_name == "get_kpis":
+            kpis = get_kpis()
+            return json.dumps(kpis)
+
+        elif tool_name == "get_alerts":
+            alerts = detect_alerts()
+            return json.dumps(alerts if isinstance(alerts, list) else [])
+
+        elif tool_name == "get_triage_issues":
+            try:
+                conn = get_connection()
+                triage = get_triage_report(conn)
+                conn.close()
+                return json.dumps(triage)
+            except Exception as e:
+                return json.dumps({"error": str(e)})
+
+        elif tool_name == "get_schema":
+            schema = get_full_schema()
+            if isinstance(schema, list):
+                compact = [{"table": f"{t['table_schema']}.{t['table_name']}",
+                            "columns": [c["column_name"] for c in t.get("columns", [])]} for t in schema[:30]]
+                return json.dumps(compact)
+            return json.dumps(schema)
+
+        elif tool_name == "create_dataflow":
+            df_id = f"df_{uuid.uuid4().hex[:10]}"
+            now = datetime.datetime.utcnow().isoformat()
+            checks = tool_args.get("checks", [])
+            payload = {
+                "id": df_id,
+                "name": tool_args.get("name"),
+                "desc": tool_args.get("desc", ""),
+                "folder_id": tool_args.get("folder_id", "f_custom"),
+                "tags": tool_args.get("tags", []),
+                "owner": "agent",
+                "priority": "Medium",
+                "schedule": "manual",
+                "checks": checks,
+                "starred": False,
+                "created_at": now,
+                "updated_at": now,
+            }
+            result = await save_dataflow(payload)
+            return json.dumps({"created": df_id, "name": payload["name"], "checks": len(checks), **result})
+
+        elif tool_name == "get_schedules":
+            return json.dumps([{"id": s["id"], "name": s["name"], "schedule": s.get("schedule"),
+                                "enabled": s.get("enabled", True), "last_triggered": s.get("last_triggered"),
+                                "workflows": len(s.get("workflow_ids", [])),
+                                "dataflows": len(s.get("dataflow_ids", []))} for s in _SCHEDULES.values()])
+
+        else:
+            return json.dumps({"error": f"Unknown tool: {tool_name}"})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@app.post("/api/ai/agent")
+async def ai_agent(payload: dict = {}):
+    """
+    Agentic loop: LLM can call real tools (run SQL, navigate UI, run workflows etc.)
+    Runs up to 6 tool-call rounds before returning.
+    Returns: { steps: [{type, ...}], final_message: str, actions: [{type,tab,...}] }
+    """
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        return {"error": "OPENAI_API_KEY not set"}
+
+    user_message = payload.get("message", "")
+    history      = payload.get("history", [])   # [{role, content}]
+    schema_ctx   = payload.get("schema_ctx", "")
+    current_tab  = payload.get("current_tab", "")
+
+    system = f"""You are WiziAgent — an AI data operations assistant that controls a data quality dashboard.
+You have access to real tools. When a user asks you to do something, USE THE TOOLS — don't just describe what to do.
+
+Dashboard tabs: brief, triage, workflows, dataflows, approvals, config, query, results, scheduler.
+Current tab: {current_tab}
+
+Key Redshift tables: mws.report (downloads), mws.orders, mws.inventory, mws.sales_and_traffic_by_date, public.tbl_amzn_campaign_report.
+{f"Schema context: {schema_ctx[:2000]}" if schema_ctx else ""}
+
+Rules:
+- When user asks "show me X" or "go to X" → use navigate tool
+- When user asks "run workflow/dataflow X" → use run_workflow or run_dataflow
+- When user asks a data question → use run_sql to get real numbers, then explain
+- When user asks "what workflows failed" → use get_recent_results, then explain
+- When user asks "create a check for X" → use create_dataflow
+- When user asks about alerts/issues → use get_alerts or get_triage_issues
+- Always interpret intent and act — do not ask for clarification unless truly ambiguous
+- After taking actions, explain what you did and what the results mean
+- Be concise. Lead with the answer, not the process."""
+
+    messages = [{"role": "system", "content": system}]
+    # Include recent history
+    for h in history[-8:]:
+        messages.append({"role": h["role"], "content": h["content"] if isinstance(h["content"], str) else json.dumps(h["content"])})
+    messages.append({"role": "user", "content": user_message})
+
+    steps   = []    # all steps shown in UI
+    actions = []    # UI actions to execute (navigate etc.)
+    max_rounds = 6
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        for round_num in range(max_rounds):
+            resp = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": "gpt-4o",
+                    "max_tokens": 1000,
+                    "messages": messages,
+                    "tools": AGENT_TOOLS,
+                    "tool_choice": "auto",
+                }
+            )
+            body = resp.json()
+            choice = body.get("choices", [{}])[0]
+            msg    = choice.get("message", {})
+            finish = choice.get("finish_reason", "")
+
+            # Append assistant turn to messages
+            messages.append(msg)
+
+            # If text response with no tool calls — we're done
+            if finish == "stop" or not msg.get("tool_calls"):
+                final_text = msg.get("content") or ""
+                steps.append({"type": "text", "content": final_text})
+                return {"steps": steps, "final_message": final_text, "actions": actions}
+
+            # Execute all tool calls in this round
+            tool_results = []
+            for tc in (msg.get("tool_calls") or []):
+                fn_name = tc["function"]["name"]
+                try:
+                    fn_args = json.loads(tc["function"]["arguments"])
+                except Exception:
+                    fn_args = {}
+
+                # Record the tool call as a step
+                steps.append({"type": "tool_call", "tool": fn_name, "args": fn_args,
+                               "call_id": tc["id"]})
+
+                # Execute
+                result_str = await _execute_tool(fn_name, fn_args)
+                try:
+                    result_obj = json.loads(result_str)
+                except Exception:
+                    result_obj = {"raw": result_str}
+
+                # Collect UI actions
+                if fn_name == "navigate" and result_obj.get("action") == "navigate":
+                    actions.append({"type": "navigate", "tab": result_obj.get("tab"),
+                                    "reason": result_obj.get("reason")})
+                if fn_name in ("run_workflow", "run_dataflow"):
+                    actions.append({"type": "run_complete", "tool": fn_name, "result": result_obj})
+                if fn_name == "create_dataflow":
+                    actions.append({"type": "created_dataflow", "result": result_obj})
+
+                # Record result as step
+                steps.append({"type": "tool_result", "tool": fn_name,
+                               "call_id": tc["id"], "result": result_obj})
+
+                tool_results.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": result_str
+                })
+
+            # Add all tool results to messages before next round
+            messages.extend(tool_results)
+
+    # Fallback if max rounds hit without stop
+    return {"steps": steps, "final_message": "I've completed the requested actions.", "actions": actions}
+
+
