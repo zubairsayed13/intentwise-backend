@@ -4982,6 +4982,17 @@ async def _master_startup():
         except Exception: pass
         try: _load_sop_runs()
         except Exception: pass
+        try: _load_check_library()
+        except Exception: pass
+        # Load SLA thresholds
+        try:
+            conn = get_connection()
+            rows = q(conn, "SELECT data_json FROM wz_uploads._schema WHERE table_key='sla_thresholds' LIMIT 1")
+            conn.close()
+            if rows:
+                global SLA_THRESHOLDS
+                SLA_THRESHOLDS.update(json.loads(rows[0]["data_json"]))
+        except Exception: pass
 
     # Run in thread to avoid blocking startup
     import threading
@@ -5058,3 +5069,447 @@ async def run_evals_persistent(payload: dict = {}):
         import threading
         threading.Thread(target=_save_eval_run, args=(result,), daemon=True).start()
     return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1. PIPELINE COVERAGE MAP
+# account × report_type × date matrix from mws.report
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/coverage/matrix")
+async def coverage_matrix(days: int = Query(14), account_id: str = Query(None)):
+    """
+    Returns account × report_type × date coverage matrix.
+    Each cell: { status: 'replicated'|'processed'|'failed'|'missing', count }
+    """
+    try:
+        conn = get_connection()
+        af = f"AND account_id='{account_id}'" if account_id else ""
+        rows = q(conn, f"""
+            SELECT
+                COALESCE(account_id::text, account::text, 'unknown') AS account_id,
+                report_type,
+                download_date::text AS dt,
+                status,
+                COALESCE(copy_status, 'NOT_REPLICATED') AS copy_status,
+                COUNT(*) AS cnt
+            FROM mws.report
+            WHERE download_date >= CURRENT_DATE - {days}
+            {af}
+            GROUP BY 1,2,3,4,5
+            ORDER BY dt DESC, account_id, report_type
+        """)
+        conn.close()
+
+        # Build matrix structure
+        accounts      = sorted(set(r["account_id"] for r in rows))
+        report_types  = sorted(set(r["report_type"] for r in rows if r["report_type"]))
+        dates         = sorted(set(r["dt"] for r in rows), reverse=True)[:days]
+
+        # Cell lookup
+        lookup = {}
+        for r in rows:
+            key = (r["account_id"], r["report_type"] or "", r["dt"])
+            if key not in lookup or r["copy_status"] == "REPLICATED":
+                status = (
+                    "replicated" if r["copy_status"] == "REPLICATED" else
+                    "failed"     if r["status"] == "failed" else
+                    "processed"  if r["status"] == "processed" else
+                    "pending"
+                )
+                lookup[key] = {"status": status, "count": int(r["cnt"]),
+                               "copy_status": r["copy_status"], "status_raw": r["status"]}
+
+        return {
+            "accounts":     accounts,
+            "report_types": report_types,
+            "dates":        dates,
+            "cells":        {f"{k[0]}|{k[1]}|{k[2]}": v for k, v in lookup.items()},
+            "summary": {
+                "total_expected": len(accounts) * len(report_types) * len(dates),
+                "covered":  sum(1 for v in lookup.values() if v["status"] in ("replicated","processed")),
+                "failed":   sum(1 for v in lookup.values() if v["status"] == "failed"),
+                "missing":  len(accounts)*len(report_types)*len(dates) - len(lookup),
+            }
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/coverage/report-types")
+def coverage_report_types():
+    """Distinct report types in mws.report."""
+    try:
+        conn = get_connection()
+        rows = q(conn, "SELECT DISTINCT report_type FROM mws.report WHERE report_type IS NOT NULL ORDER BY 1")
+        conn.close()
+        return [r["report_type"] for r in rows]
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2. SLA TRACKER
+# Tracks pipeline deadlines per day — did data arrive on time?
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# SLA thresholds (configurable via env or defaults)
+SLA_THRESHOLDS = {
+    "data_available_by":  os.getenv("SLA_DATA_AVAILABLE",  "15:30"),  # IST
+    "replicated_by":      os.getenv("SLA_REPLICATED",      "16:00"),  # IST
+    "sop_trigger_by":     os.getenv("SLA_SOP_TRIGGER",     "16:20"),  # IST
+    "fully_processed_by": os.getenv("SLA_FULLY_PROCESSED", "19:00"),  # IST
+}
+
+@app.get("/api/sla/history")
+async def sla_history(days: int = Query(30)):
+    """
+    Returns per-day SLA status for the last N days.
+    Each day: { date, data_available_time, replicated_time, hit_sla, delays }
+    """
+    try:
+        conn = get_connection()
+        rows = q(conn, f"""
+            SELECT
+                download_date::text AS dt,
+                MIN(CASE WHEN status IN ('processed','failed') THEN requested_date END)::text AS first_arrived,
+                MAX(CASE WHEN copy_status='REPLICATED' THEN requested_date END)::text          AS last_replicated,
+                COUNT(*) AS total,
+                SUM(CASE WHEN status='processed' THEN 1 ELSE 0 END)                           AS processed,
+                SUM(CASE WHEN status='failed'    THEN 1 ELSE 0 END)                           AS failed,
+                SUM(CASE WHEN copy_status='REPLICATED' THEN 1 ELSE 0 END)                     AS replicated
+            FROM mws.report
+            WHERE download_date >= CURRENT_DATE - {days}
+            GROUP BY 1
+            ORDER BY 1 DESC
+        """)
+        conn.close()
+
+        results = []
+        for r in rows:
+            # Extract IST time from timestamp
+            def to_ist_time(ts_str):
+                if not ts_str: return None
+                try:
+                    import pytz
+                    utc = datetime.datetime.fromisoformat(str(ts_str)[:19])
+                    ist = utc + datetime.timedelta(hours=5, minutes=30)
+                    return ist.strftime("%H:%M")
+                except Exception:
+                    return None
+
+            arrived_ist   = to_ist_time(r["first_arrived"])
+            replicated_ist = to_ist_time(r["last_replicated"])
+
+            def time_ok(actual_ist, threshold_ist):
+                if not actual_ist: return None
+                try:
+                    ah, am = map(int, actual_ist.split(":"))
+                    th, tm = map(int, threshold_ist.split(":"))
+                    return ah * 60 + am <= th * 60 + tm
+                except Exception:
+                    return None
+
+            data_ok  = time_ok(arrived_ist,    SLA_THRESHOLDS["data_available_by"])
+            repl_ok  = time_ok(replicated_ist, SLA_THRESHOLDS["replicated_by"])
+            hit_sla  = bool(data_ok and repl_ok)
+
+            results.append({
+                "date":             r["dt"],
+                "total":            int(r["total"]),
+                "processed":        int(r["processed"]),
+                "failed":           int(r["failed"]),
+                "replicated":       int(r["replicated"]),
+                "arrived_ist":      arrived_ist,
+                "replicated_ist":   replicated_ist,
+                "data_on_time":     data_ok,
+                "replication_on_time": repl_ok,
+                "hit_sla":          hit_sla,
+            })
+
+        total_days = len(results)
+        hit_days   = sum(1 for r in results if r["hit_sla"])
+        return {
+            "sla_history":  results,
+            "thresholds":   SLA_THRESHOLDS,
+            "summary": {
+                "days_tracked":  total_days,
+                "days_hit_sla":  hit_days,
+                "hit_rate_pct":  round(hit_days / total_days * 100) if total_days else 0,
+                "avg_arrival_delay_min": None,  # TODO: compute from IST diffs
+            }
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/sla/thresholds")
+async def update_sla_thresholds(payload: dict = {}):
+    """Update SLA thresholds in memory (persisted to _schema table)."""
+    global SLA_THRESHOLDS
+    for k in ["data_available_by","replicated_by","sop_trigger_by","fully_processed_by"]:
+        if k in payload:
+            SLA_THRESHOLDS[k] = payload[k]
+    # Persist
+    try:
+        conn = get_connection()
+        _ensure_uploads_schema(conn)
+        _ensure_storage_tables(conn)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM wz_uploads._schema WHERE table_key='sla_thresholds'")
+        cur.execute("INSERT INTO wz_uploads._schema (table_key, data_json) VALUES (%s,%s)",
+                    ["sla_thresholds", json.dumps(SLA_THRESHOLDS)])
+        conn.commit(); cur.close(); conn.close()
+    except Exception: pass
+    return {"updated": SLA_THRESHOLDS}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3. CHECK LIBRARY
+# Shared reusable SQL checks stored in Redshift
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_CHECK_LIBRARY: list = []  # in-memory cache
+
+def _ensure_check_library_table(conn):
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS wz_uploads._check_library (
+            check_id     VARCHAR(64),
+            check_json   VARCHAR(65535),
+            created_at   TIMESTAMP DEFAULT GETDATE()
+        )
+    """)
+    conn.commit(); cur.close()
+
+def _load_check_library(db_key="default"):
+    global _CHECK_LIBRARY
+    try:
+        conn = get_connection(db_key)
+        _ensure_uploads_schema(conn)
+        _ensure_check_library_table(conn)
+        rows = q(conn, "SELECT check_json FROM wz_uploads._check_library ORDER BY created_at DESC")
+        conn.close()
+        _CHECK_LIBRARY = [json.loads(r["check_json"]) for r in rows]
+    except Exception: pass
+
+@app.get("/api/check-library")
+def get_check_library():
+    if not _CHECK_LIBRARY:
+        _load_check_library()
+    return {"checks": _CHECK_LIBRARY, "count": len(_CHECK_LIBRARY)}
+
+@app.post("/api/check-library")
+async def save_check_to_library(payload: dict = {}):
+    """Save a check to the shared library."""
+    chk_id = payload.get("id") or uuid.uuid4().hex[:10]
+    check = {
+        "id":             chk_id,
+        "name":           payload.get("name",""),
+        "desc":           payload.get("desc",""),
+        "sql":            payload.get("sql",""),
+        "pass_condition": payload.get("pass_condition","rows = 0"),
+        "severity":       payload.get("severity","high"),
+        "tags":           payload.get("tags",[]),
+        "table_hint":     payload.get("table_hint",""),
+        "saved_at":       datetime.datetime.utcnow().isoformat(),
+        "saved_by":       payload.get("saved_by",""),
+    }
+    try:
+        conn = get_connection()
+        _ensure_uploads_schema(conn)
+        _ensure_check_library_table(conn)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM wz_uploads._check_library WHERE check_id=%s", [chk_id])
+        cur.execute("INSERT INTO wz_uploads._check_library (check_id, check_json) VALUES (%s,%s)",
+                    [chk_id, json.dumps(check)])
+        conn.commit(); cur.close(); conn.close()
+        # Update cache
+        _CHECK_LIBRARY[:] = [c for c in _CHECK_LIBRARY if c["id"] != chk_id]
+        _CHECK_LIBRARY.insert(0, check)
+    except Exception as e:
+        return {"error": str(e)}
+    return {"saved": True, "check": check}
+
+@app.delete("/api/check-library/{check_id}")
+def delete_check_from_library(check_id: str):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM wz_uploads._check_library WHERE check_id=%s", [check_id])
+        conn.commit(); cur.close(); conn.close()
+        _CHECK_LIBRARY[:] = [c for c in _CHECK_LIBRARY if c["id"] != check_id]
+    except Exception as e:
+        return {"error": str(e)}
+    return {"deleted": True}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 4. DIFF VIEW
+# Compare two workflow runs — what changed between them
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/workflow-runs/diff")
+async def diff_runs(run_id_a: str = Query(...), run_id_b: str = Query(...)):
+    """
+    Compare two runs from _wf_run_log.
+    Returns per-check diff: status change, row count delta.
+    """
+    def find_run(rid):
+        # Check memory first
+        for r in _wf_run_history:
+            if r.get("run_id") == rid:
+                return r
+        # Then Redshift
+        try:
+            conn = get_connection()
+            rows = q(conn, "SELECT run_json FROM wz_uploads._wf_run_log WHERE run_id=%s LIMIT 1", [rid])
+            conn.close()
+            if rows: return json.loads(rows[0]["run_json"])
+        except Exception: pass
+        return None
+
+    run_a = find_run(run_id_a)
+    run_b = find_run(run_id_b)
+    if not run_a or not run_b:
+        return {"error": "One or both runs not found"}
+
+    checks_a = {c["name"]: c for c in (run_a.get("check_results") or [])}
+    checks_b = {c["name"]: c for c in (run_b.get("check_results") or [])}
+    all_names = sorted(set(list(checks_a.keys()) + list(checks_b.keys())))
+
+    diffs = []
+    for name in all_names:
+        ca = checks_a.get(name)
+        cb = checks_b.get(name)
+        if ca and cb:
+            row_delta = (cb.get("row_count") or 0) - (ca.get("row_count") or 0)
+            status_changed = ca.get("passed") != cb.get("passed")
+            diffs.append({
+                "name":           name,
+                "kind":           "changed",
+                "a_passed":       ca.get("passed"),
+                "b_passed":       cb.get("passed"),
+                "a_rows":         ca.get("row_count"),
+                "b_rows":         cb.get("row_count"),
+                "row_delta":      row_delta,
+                "status_changed": status_changed,
+                "regression":     not cb.get("passed") and ca.get("passed"),  # was passing, now failing
+                "fixed":          cb.get("passed") and not ca.get("passed"),  # was failing, now passing
+            })
+        elif ca and not cb:
+            diffs.append({"name": name, "kind": "removed", "a_passed": ca.get("passed"), "b_passed": None})
+        else:
+            diffs.append({"name": name, "kind": "added", "a_passed": None, "b_passed": cb.get("passed")})
+
+    regressions = [d for d in diffs if d.get("regression")]
+    fixes       = [d for d in diffs if d.get("fixed")]
+
+    return {
+        "run_a":       {"run_id": run_id_a, "started_at": run_a.get("started_at"), "status": run_a.get("status"), "failed": run_a.get("failed",0)},
+        "run_b":       {"run_id": run_id_b, "started_at": run_b.get("started_at"), "status": run_b.get("status"), "failed": run_b.get("failed",0)},
+        "diffs":        diffs,
+        "regressions":  regressions,
+        "fixes":        fixes,
+        "summary": {
+            "total_checks": len(diffs),
+            "regressions":  len(regressions),
+            "fixes":        len(fixes),
+            "unchanged":    len([d for d in diffs if not d.get("status_changed") and d.get("kind")=="changed"]),
+        }
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5. SCHEDULED REPORT DIGEST
+# Weekly Slack/email digest of pipeline health
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/digest/send")
+async def send_digest(payload: dict = {}):
+    """
+    Build and send a pipeline health digest to Slack.
+    Called manually or by cron.
+    """
+    days = payload.get("days", 7)
+    slack_url = payload.get("slack_url") or os.getenv("SLACK_WEBHOOK_URL","")
+    if not slack_url:
+        return {"error": "No Slack webhook configured"}
+
+    try:
+        # Gather data
+        sla_data = await sla_history(days=days)
+        conn = get_connection()
+
+        # Workflow run summary
+        wf_summary = q(conn, f"""
+            SELECT COUNT(*) AS total_runs,
+                   SUM(CASE WHEN run_json LIKE '%\"status\": \"clean\"%' THEN 1 ELSE 0 END) AS clean_runs
+            FROM wz_uploads._wf_run_log
+            WHERE started_at >= CURRENT_DATE - {days}
+        """) if True else []
+
+        # Top failing checks
+        conn.close()
+
+        sla = sla_data.get("summary", {})
+        hit_rate = sla.get("hit_rate_pct", 0)
+        days_hit = sla.get("days_hit_sla", 0)
+        days_total = sla.get("days_tracked", days)
+
+        emoji = "🟢" if hit_rate >= 90 else "🟡" if hit_rate >= 70 else "🔴"
+
+        msg = (
+            f"{emoji} *Pipeline Health Digest — Last {days} days*\n\n"
+            f"*SLA Hit Rate:* {hit_rate}% ({days_hit}/{days_total} days on time)\n"
+            f"*Data Available by {SLA_THRESHOLDS['data_available_by']} IST:* "
+            f"{sum(1 for r in sla_data.get('sla_history',[]) if r.get('data_on_time'))}/{days_total} days ✓\n"
+            f"*Replication by {SLA_THRESHOLDS['replicated_by']} IST:* "
+            f"{sum(1 for r in sla_data.get('sla_history',[]) if r.get('replication_on_time'))}/{days_total} days ✓\n\n"
+            f"_Generated by WiziAgent QA Platform_"
+        )
+
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(slack_url, json={"text": msg})
+
+        # Store digest record
+        digest = {
+            "sent_at": datetime.datetime.utcnow().isoformat(),
+            "days": days, "hit_rate": hit_rate,
+            "slack_ok": resp.status_code == 200
+        }
+        try:
+            conn2 = get_connection()
+            _ensure_uploads_schema(conn2)
+            _ensure_storage_tables(conn2)
+            cur = conn2.cursor()
+            cur.execute("DELETE FROM wz_uploads._schema WHERE table_key='last_digest'")
+            cur.execute("INSERT INTO wz_uploads._schema (table_key, data_json) VALUES (%s,%s)",
+                        ["last_digest", json.dumps(digest)])
+            conn2.commit(); cur.close(); conn2.close()
+        except Exception: pass
+
+        return {"sent": True, "hit_rate": hit_rate, "days": days}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/digest/preview")
+async def digest_preview(days: int = Query(7)):
+    """Preview digest content without sending."""
+    sla_data = await sla_history(days=days)
+    sla = sla_data.get("summary", {})
+    last = {}
+    try:
+        conn = get_connection()
+        rows = q(conn, "SELECT data_json FROM wz_uploads._schema WHERE table_key='last_digest' LIMIT 1")
+        conn.close()
+        if rows: last = json.loads(rows[0]["data_json"])
+    except Exception: pass
+    return {
+        "sla_summary":   sla,
+        "sla_history":   sla_data.get("sla_history",[])[:days],
+        "thresholds":    SLA_THRESHOLDS,
+        "last_sent":     last.get("sent_at"),
+        "last_hit_rate": last.get("hit_rate"),
+    }
