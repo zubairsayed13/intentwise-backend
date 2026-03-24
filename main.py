@@ -3343,13 +3343,12 @@ async def _run_sop(run_id: str, gate_timeout_min: int = None):
         label = _gate_labels.get(f"gate{gate_num}", f"Gate {gate_num}")
         try:
             async with httpx.AsyncClient(timeout=5) as client:
-                await client.post(_slack_url, json={"text":
-                    f"⏳ *Daily Ads Check — Gate {gate_num} awaiting approval*
-"
-                    f"Action required: *{label}*
-"
+                msg = (
+                    f"⏳ *Daily Ads Check — Gate {gate_num} awaiting approval*\n"
+                    f"Action required: *{label}*\n"
                     f"Open the dashboard to approve or reject."
-                })
+                )
+                await client.post(_slack_url, json={"text": msg})
         except Exception:
             pass
 
