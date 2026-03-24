@@ -4984,6 +4984,8 @@ async def _master_startup():
         except Exception: pass
         try: _load_check_library()
         except Exception: pass
+        try: _load_notes()
+        except Exception: pass
         # Load SLA thresholds
         try:
             conn = get_connection()
@@ -5513,3 +5515,417 @@ async def digest_preview(days: int = Query(7)):
         "last_sent":     last.get("sent_at"),
         "last_hit_rate": last.get("hit_rate"),
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WORKFLOW RESULTS — full data view, notes, sharing
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_run_notes: dict = {}  # { run_id: { check_id: note_text } }
+
+def _ensure_notes_table(conn):
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS wz_uploads._run_notes (
+            run_id     VARCHAR(64),
+            check_id   VARCHAR(64),
+            note_text  VARCHAR(4096),
+            updated_at TIMESTAMP DEFAULT GETDATE()
+        )
+    """)
+    conn.commit(); cur.close()
+
+
+@app.get("/api/workflow-results/full")
+async def get_full_check_results(
+    run_id:   str = Query(...),
+    check_id: str = Query(...),
+    limit:    int = Query(500),
+    offset:   int = Query(0),
+    db_key:   str = Query("default"),
+):
+    """
+    Re-execute a check's SQL with full row fetch.
+    Returns paginated rows, column types, summary stats, and source table context.
+    """
+    # Find the run
+    run = None
+    for r in _wf_run_history:
+        if r.get("run_id") == run_id:
+            run = r; break
+    if not run:
+        try:
+            conn = get_connection(db_key)
+            rows = q(conn, "SELECT run_json FROM wz_uploads._wf_run_log WHERE run_id=%s LIMIT 1", [run_id])
+            conn.close()
+            if rows: run = json.loads(rows[0]["run_json"])
+        except Exception: pass
+    if not run:
+        return {"error": f"Run {run_id} not found"}
+
+    # Find the check
+    check = None
+    for c in (run.get("check_results") or []):
+        if c.get("id") == check_id or c.get("name") == check_id:
+            check = c; break
+    if not check:
+        return {"error": f"Check {check_id} not found in run"}
+
+    sql = (check.get("sql") or "").strip()
+    if not sql:
+        return {"error": "No SQL stored for this check"}
+
+    # Re-execute with pagination
+    try:
+        conn = get_connection(run.get("db_key") or db_key)
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        # Count total
+        count_sql = f"SELECT COUNT(*) AS total FROM ({sql}) _sub"
+        try:
+            cur.execute(count_sql)
+            total_rows = cur.fetchone()["total"]
+        except Exception:
+            total_rows = None
+
+        # Paginated fetch
+        paged_sql = f"SELECT * FROM ({sql}) _sub LIMIT {limit} OFFSET {offset}"
+        cur.execute(paged_sql)
+        rows_out = cur.fetchall()
+        cols     = [d[0] for d in cur.description] if cur.description else []
+        cur.close()
+
+        row_dicts = [dict(r) for r in rows_out]
+
+        # Summary stats per column
+        stats = {}
+        for col in cols:
+            vals = [r[col] for r in row_dicts if r[col] is not None]
+            null_count = len(row_dicts) - len(vals)
+            stats[col] = {"null_count": null_count, "distinct": len(set(str(v) for v in vals))}
+            # Numeric stats
+            try:
+                nums = [float(v) for v in vals]
+                if nums:
+                    stats[col].update({
+                        "min": min(nums), "max": max(nums),
+                        "sum": round(sum(nums), 4),
+                        "avg": round(sum(nums)/len(nums), 4),
+                    })
+            except (TypeError, ValueError):
+                pass
+
+        # Source table context — try to get total row count for context
+        source_context = {}
+        wf_id = run.get("workflow_id")
+        if wf_id and wf_id in _CUSTOM_WORKFLOWS:
+            wf = _CUSTOM_WORKFLOWS[wf_id]
+            for tbl in (wf.get("tables") or []):
+                try:
+                    rc = q(conn, f"SELECT COUNT(*) AS cnt FROM {tbl}")
+                    source_context[tbl] = {"total_rows": int(rc[0]["cnt"]) if rc else 0}
+                except Exception:
+                    source_context[tbl] = {"error": "Could not query"}
+
+        conn.close()
+
+        # Load note if exists
+        note = (_run_notes.get(run_id) or {}).get(check_id, "")
+
+        return {
+            "run_id":         run_id,
+            "check_id":       check_id,
+            "check_name":     check.get("name",""),
+            "sql":            sql,
+            "pass_condition": check.get("pass_condition",""),
+            "passed":         check.get("passed"),
+            "severity":       check.get("severity","high"),
+            "columns":        cols,
+            "rows":           row_dicts,
+            "total_rows":     total_rows,
+            "fetched":        len(row_dicts),
+            "offset":         offset,
+            "limit":          limit,
+            "stats":          stats,
+            "source_context": source_context,
+            "note":           note,
+            "run_started_at": run.get("started_at",""),
+            "workflow_name":  run.get("workflow_name",""),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/workflow-results/note")
+async def save_result_note(payload: dict = {}):
+    """Save an annotation note for a check result."""
+    run_id   = payload.get("run_id","")
+    check_id = payload.get("check_id","")
+    note     = payload.get("note","")
+    if not run_id or not check_id:
+        return {"error": "run_id and check_id required"}
+
+    if run_id not in _run_notes:
+        _run_notes[run_id] = {}
+    _run_notes[run_id][check_id] = note
+
+    # Persist
+    try:
+        conn = get_connection()
+        _ensure_uploads_schema(conn)
+        _ensure_notes_table(conn)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM wz_uploads._run_notes WHERE run_id=%s AND check_id=%s", [run_id, check_id])
+        if note.strip():
+            cur.execute("INSERT INTO wz_uploads._run_notes (run_id, check_id, note_text) VALUES (%s,%s,%s)",
+                        [run_id, check_id, note])
+        conn.commit(); cur.close(); conn.close()
+    except Exception: pass
+    return {"saved": True}
+
+
+@app.post("/api/workflow-results/share-slack")
+async def share_result_to_slack(payload: dict = {}):
+    """Share a check result summary to Slack."""
+    run_id     = payload.get("run_id","")
+    check_name = payload.get("check_name","")
+    wf_name    = payload.get("workflow_name","")
+    row_count  = payload.get("row_count",0)
+    severity   = payload.get("severity","high")
+    note       = payload.get("note","")
+    sql        = payload.get("sql","")
+    slack_url  = payload.get("slack_url") or os.getenv("SLACK_WEBHOOK_URL","")
+
+    if not slack_url:
+        return {"error": "No Slack webhook configured"}
+
+    sev_emoji = {"critical":"🔴","high":"🟠","medium":"🟡","low":"🔵"}.get(severity,"⚠️")
+    msg = (
+        f"{sev_emoji} *Workflow Check Result — {wf_name}*\n"
+        f"Check: `{check_name}`\n"
+        f"Rows returned: *{row_count}*\n"
+        f"Severity: {severity}\n"
+    )
+    if note:
+        msg += f"Note: _{note}_\n"
+    if sql:
+        msg += f"```{sql[:300]}{'...' if len(sql)>300 else ''}```"
+
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.post(slack_url, json={"text": msg})
+        return {"sent": True, "status": resp.status_code}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/workflow-results/recent")
+def get_recent_results(limit: int = Query(50)):
+    """Return recent run records with check summaries for the Results tab."""
+    runs = list(reversed(_wf_run_history[:limit]))
+    # Supplement from DB if memory is sparse
+    if len(runs) < 10:
+        db_runs = _load_run_history_from_db(limit=limit)
+        seen = {r["run_id"] for r in runs}
+        runs = runs + [r for r in db_runs if r["run_id"] not in seen]
+    return {"runs": runs[:limit]}
+
+
+# Load notes on startup
+def _load_notes(db_key="default"):
+    global _run_notes
+    try:
+        conn = get_connection(db_key)
+        try:
+            _ensure_uploads_schema(conn)
+            _ensure_notes_table(conn)
+            rows = q(conn, "SELECT run_id, check_id, note_text FROM wz_uploads._run_notes")
+            conn.close()
+            for r in rows:
+                if r["run_id"] not in _run_notes:
+                    _run_notes[r["run_id"]] = {}
+                _run_notes[r["run_id"]][r["check_id"]] = r["note_text"]
+        except Exception:
+            conn.close()
+    except Exception: pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AI ASSISTANT — run analysis, daily brief AI, follow-up checks
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/ai/analyse-run")
+async def ai_analyse_run(payload: dict = {}):
+    """
+    AI analysis of a workflow run result.
+    Returns: { summary, root_cause, severity_assessment, suggested_actions, follow_up_checks, fix_sql }
+    Each field is a string or list. Structured so UI can render action buttons directly.
+    """
+    run         = payload.get("run", {})
+    schema_hint = payload.get("schema_hint", "")
+    api_key     = os.environ.get("OPENAI_API_KEY","")
+    if not api_key:
+        return {"error": "OPENAI_API_KEY not set"}
+
+    check_results = run.get("check_results") or []
+    failed = [c for c in check_results if not c.get("passed")]
+    passed = [c for c in check_results if c.get("passed")]
+
+    if not failed:
+        return {
+            "summary": "All checks passed — pipeline looks healthy.",
+            "root_cause": None,
+            "severity_assessment": "clean",
+            "suggested_actions": [],
+            "follow_up_checks": [],
+            "fix_sql": None,
+        }
+
+    # Build context for AI
+    failed_summary = "\n".join([
+        f"- {c['name']}: {c['row_count']} rows returned (pass condition: {c['pass_condition']})"
+        + (f"\n  Sample: {c['sample_rows'][:2]}" if c.get('sample_rows') else "")
+        + (f"\n  Error: {c['error']}" if c.get('error') else "")
+        + (f"\n  SQL: {c['sql']}" if c.get('sql') else "")
+        for c in failed
+    ])
+
+    system = f"""You are WiziAgent, a data quality AI for an ecommerce analytics platform using Amazon Redshift.
+You are analysing a failed workflow run and must return ONLY a JSON object with no markdown.
+
+Available tables: mws.report (report_type, status, copy_status, requested_date, download_date, account_id),
+mws.orders (amazon_order_id, asin, item_price, order_status, download_date, account_id),
+mws.inventory (asin, available, download_date, account_id),
+public.tbl_amzn_campaign_report, public.tbl_amzn_keyword_report.
+{('Schema context: ' + schema_hint) if schema_hint else ''}
+
+Return exactly this JSON shape:
+{{
+  "summary": "2-3 sentence plain English summary of what failed and why it matters",
+  "root_cause": "Most likely root cause in 1 sentence",
+  "severity_assessment": "critical|high|medium|low",
+  "suggested_actions": ["action1", "action2"],
+  "follow_up_checks": [
+    {{"name": "check name", "sql": "SELECT ...", "pass_condition": "rows = 0", "reason": "why this helps"}}
+  ],
+  "fix_sql": "UPDATE/DELETE SQL to fix the issue, or null if no safe fix exists",
+  "notify_message": "Short Slack message to send if notifying team"
+}}"""
+
+    user_msg = f"""Workflow: {run.get('workflow_name','Unknown')}
+Run ID: {run.get('run_id','')}
+Started: {run.get('started_at','')}
+Total checks: {len(check_results)} ({len(failed)} failed, {len(passed)} passed)
+
+Failed checks:
+{failed_summary}"""
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"model":"gpt-4o","max_tokens":800,
+                      "messages":[{"role":"system","content":system},{"role":"user","content":user_msg}]}
+            )
+        body   = r.json()
+        text   = body.get("choices",[{}])[0].get("message",{}).get("content","")
+        result = json.loads(text.replace("```json","").replace("```","").strip())
+        result["run_id"] = run.get("run_id","")
+        return result
+    except Exception as e:
+        return {"error": str(e), "summary": "AI analysis failed — check API key.", "suggested_actions": []}
+
+
+@app.post("/api/ai/daily-brief")
+async def ai_daily_brief(payload: dict = {}):
+    """
+    AI-generated daily brief: summarises all runs + anomalies + SLA from last 24h.
+    Returns prioritised list of items needing attention.
+    """
+    api_key = os.environ.get("OPENAI_API_KEY","")
+    if not api_key:
+        return {"error": "OPENAI_API_KEY not set"}
+
+    # Gather context
+    recent_runs = _wf_run_history[:20]
+    failed_runs = [r for r in recent_runs if r.get("status") != "clean"]
+    clean_runs  = [r for r in recent_runs if r.get("status") == "clean"]
+
+    # SLA
+    try:
+        sla_resp = await sla_history(days=7)
+        sla_summary = sla_resp.get("summary",{})
+        recent_sla  = sla_resp.get("sla_history",[])[:3]
+    except Exception:
+        sla_summary = {}; recent_sla = []
+
+    # Anomaly baselines
+    anomaly_tables = list(_baselines.keys())[:5]
+
+    run_lines = "\n".join([
+        f"- {r['workflow_name']}: {r.get('failed',0)}/{r.get('total_checks',0)} checks failed"
+        + (f" ({', '.join(c['name'] for c in (r.get('check_results') or []) if not c.get('passed'))[:3]})" if r.get('check_results') else "")
+        for r in failed_runs[:5]
+    ]) or "No failed runs"
+
+    system = """You are WiziAgent. Generate a concise daily data quality brief.
+Return ONLY JSON, no markdown:
+{
+  "headline": "One sentence status e.g. '2 workflows failed, SLA on track'",
+  "health_score": 0-100,
+  "priority_items": [
+    {"priority": 1, "title": "...", "detail": "...", "action": "check_workflows|check_sla|run_triage|none", "urgency": "critical|high|medium|low"}
+  ],
+  "all_clear": true/false,
+  "recommendation": "One concrete thing to do right now"
+}"""
+
+    user_msg = f"""Last 24h summary:
+- Total runs: {len(recent_runs)} ({len(failed_runs)} failed, {len(clean_runs)} clean)
+- Failed workflows: {run_lines}
+- SLA hit rate (7 days): {sla_summary.get('hit_rate_pct','?')}% ({sla_summary.get('days_hit_sla','?')}/{sla_summary.get('days_tracked','?')} days)
+- Baselined tables: {len(anomaly_tables)}
+- Today's SLA: {recent_sla[0].get('hit_sla','?') if recent_sla else 'unknown'}"""
+
+    try:
+        async with httpx.AsyncClient(timeout=25) as client:
+            r = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"model":"gpt-4o","max_tokens":600,
+                      "messages":[{"role":"system","content":system},{"role":"user","content":user_msg}]}
+            )
+        text = r.json().get("choices",[{}])[0].get("message",{}).get("content","")
+        return json.loads(text.replace("```json","").replace("```","").strip())
+    except Exception as e:
+        return {"error": str(e), "headline": "AI brief unavailable", "priority_items": [], "all_clear": False}
+
+
+@app.post("/api/ai/run-follow-up")
+async def run_follow_up_check(payload: dict = {}):
+    """Execute a follow-up SQL check suggested by AI."""
+    sql          = payload.get("sql","").strip()
+    name         = payload.get("name","Follow-up check")
+    pass_cond    = payload.get("pass_condition","rows = 0")
+    db_key       = payload.get("db_key","default")
+
+    if not sql:
+        return {"error": "No SQL provided"}
+    try:
+        conn = get_connection(db_key)
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(sql + " LIMIT 50")
+        rows = [dict(r) for r in cur.fetchall()]
+        cols = [d[0] for d in cur.description] if cur.description else []
+        cur.close(); conn.close()
+        rc = len(rows)
+        try:
+            parts = pass_cond.split()
+            actual = float(rc) if parts[0]=="rows" else float(list(rows[0].values())[0] if rows else 0)
+            passed = eval(f"{actual} {parts[1]} {float(parts[2])}")
+        except Exception:
+            passed = rc == 0
+        return {"name":name,"sql":sql,"passed":passed,"row_count":rc,"rows":rows,"columns":cols,"pass_condition":pass_cond}
+    except Exception as e:
+        return {"error": str(e), "passed": False}
