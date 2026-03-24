@@ -9,7 +9,7 @@ load_dotenv()
 async def _background_scheduler():
     """
     Internal scheduler — runs every 60s inside the backend process.
-    Fires custom workflow cron checks and SOP auto-trigger.
+    Fires custom workflow cron checks, SOP auto-trigger, and schedule cron checks.
     No external cron service needed.
     """
     import asyncio as _asyncio
@@ -21,6 +21,10 @@ async def _background_scheduler():
             pass
         try:
             await sop_auto_trigger({})
+        except Exception:
+            pass
+        try:
+            await schedules_cron_check()
         except Exception:
             pass
 
@@ -2459,7 +2463,12 @@ async def save_custom_workflow(payload: dict = {}):
 
 @app.get("/api/custom-workflows")
 def list_custom_workflows():
-    """List all saved custom workflows."""
+    """List all saved custom workflows (v1 + v2 combined)."""
+    return list(_CUSTOM_WORKFLOWS.values())
+
+@app.get("/api/custom-workflows/list/v2")
+def list_custom_workflows_v2():
+    """Alias of GET /api/custom-workflows — returns all workflows including v2."""
     return list(_CUSTOM_WORKFLOWS.values())
 
 
@@ -6097,4 +6106,476 @@ async def save_sop_config(payload: dict = {}):
     return {"saved": True, "config": await get_sop_config().__wrapped__() if hasattr(get_sop_config,'__wrapped__') else get_sop_config()}
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# DATAFLOWS ROUTES
+# ═══════════════════════════════════════════════════════════════════════════════
 
+import json as _json
+
+def _ensure_dataflows_tables(conn):
+    """Create dataflows and folders tables if they don't exist."""
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS wz_uploads._dataflows (
+            id           VARCHAR(64) PRIMARY KEY,
+            name         VARCHAR(512),
+            description  VARCHAR(4096),
+            folder_id    VARCHAR(64),
+            tags         VARCHAR(2048),
+            owner        VARCHAR(256),
+            priority     VARCHAR(64),
+            schedule     VARCHAR(128),
+            db_key       VARCHAR(128) DEFAULT 'default',
+            checks_json  VARCHAR(65535),
+            starred      BOOLEAN DEFAULT FALSE,
+            last_run_at  TIMESTAMP,
+            last_run_status VARCHAR(32),
+            created_at   TIMESTAMP DEFAULT GETDATE(),
+            updated_at   TIMESTAMP DEFAULT GETDATE()
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS wz_uploads._df_folders (
+            id      VARCHAR(64) PRIMARY KEY,
+            name    VARCHAR(256),
+            parent  VARCHAR(64),
+            sort_order INT DEFAULT 0,
+            created_at TIMESTAMP DEFAULT GETDATE()
+        )
+    """)
+    conn.commit()
+    cur.close()
+
+
+# ── List all dataflows ────────────────────────────────────────────────────────
+@app.get("/api/dataflows")
+def list_dataflows():
+    try:
+        conn = get_connection()
+        _ensure_uploads_schema(conn)
+        _ensure_dataflows_tables(conn)
+        rows = q(conn, """
+            SELECT id, name, description, folder_id, tags, owner, priority,
+                   schedule, db_key, checks_json, starred,
+                   last_run_at, last_run_status, created_at, updated_at
+            FROM wz_uploads._dataflows
+            ORDER BY updated_at DESC
+        """)
+        conn.close()
+        result = []
+        for r in rows:
+            try:
+                checks = _json.loads(r.get("checks_json") or "[]")
+            except Exception:
+                checks = []
+            try:
+                tags = _json.loads(r.get("tags") or "[]")
+            except Exception:
+                tags = [t.strip() for t in (r.get("tags") or "").split(",") if t.strip()]
+            result.append({
+                "id":              r["id"],
+                "name":            r["name"],
+                "desc":            r.get("description",""),
+                "folder_id":       r.get("folder_id","f_root"),
+                "tags":            tags,
+                "owner":           r.get("owner",""),
+                "priority":        r.get("priority","None"),
+                "schedule":        r.get("schedule","manual"),
+                "db_key":          r.get("db_key","default"),
+                "checks":          checks,
+                "starred":         bool(r.get("starred",False)),
+                "last_run_at":     str(r["last_run_at"]) if r.get("last_run_at") else None,
+                "last_run_status": r.get("last_run_status"),
+                "created_at":      str(r["created_at"]) if r.get("created_at") else None,
+                "updated_at":      str(r["updated_at"]) if r.get("updated_at") else None,
+            })
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── Save / upsert a dataflow ──────────────────────────────────────────────────
+@app.post("/api/dataflows")
+async def save_dataflow(payload: dict = {}):
+    df_id    = (payload.get("id") or "").strip()
+    name     = (payload.get("name") or "").strip()
+    if not df_id or not name:
+        return {"error": "id and name are required"}
+
+    try:
+        conn = get_connection()
+        _ensure_uploads_schema(conn)
+        _ensure_dataflows_tables(conn)
+        cur = conn.cursor()
+
+        tags_json   = _json.dumps(payload.get("tags") or [])
+        checks_json = _json.dumps(payload.get("checks") or [])
+        starred     = bool(payload.get("starred", False))
+
+        # Check if exists
+        cur.execute("SELECT id FROM wz_uploads._dataflows WHERE id=%s", [df_id])
+        exists = cur.fetchone()
+
+        if exists:
+            cur.execute("""
+                UPDATE wz_uploads._dataflows
+                SET name=%s, description=%s, folder_id=%s, tags=%s, owner=%s,
+                    priority=%s, schedule=%s, db_key=%s, checks_json=%s,
+                    starred=%s, updated_at=GETDATE()
+                WHERE id=%s
+            """, [
+                name,
+                payload.get("desc",""),
+                payload.get("folder_id","f_root"),
+                tags_json,
+                payload.get("owner",""),
+                payload.get("priority","None"),
+                payload.get("schedule","manual"),
+                payload.get("db_key","default"),
+                checks_json,
+                starred,
+                df_id,
+            ])
+        else:
+            cur.execute("""
+                INSERT INTO wz_uploads._dataflows
+                    (id, name, description, folder_id, tags, owner, priority,
+                     schedule, db_key, checks_json, starred)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, [
+                df_id, name,
+                payload.get("desc",""),
+                payload.get("folder_id","f_root"),
+                tags_json,
+                payload.get("owner",""),
+                payload.get("priority","None"),
+                payload.get("schedule","manual"),
+                payload.get("db_key","default"),
+                checks_json,
+                starred,
+            ])
+
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"saved": df_id}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── Delete a dataflow ─────────────────────────────────────────────────────────
+@app.delete("/api/dataflows/{df_id}")
+def delete_dataflow(df_id: str):
+    try:
+        conn = get_connection()
+        _ensure_uploads_schema(conn)
+        _ensure_dataflows_tables(conn)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM wz_uploads._dataflows WHERE id=%s", [df_id])
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"deleted": df_id}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── List folders ──────────────────────────────────────────────────────────────
+@app.get("/api/dataflows/folders")
+def list_df_folders():
+    try:
+        conn = get_connection()
+        _ensure_uploads_schema(conn)
+        _ensure_dataflows_tables(conn)
+        rows = q(conn, "SELECT id, name, parent, sort_order FROM wz_uploads._df_folders ORDER BY sort_order, name")
+        conn.close()
+        return [{"id":r["id"],"name":r["name"],"parent":r.get("parent"),"sort_order":r.get("sort_order",0)} for r in rows]
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── Save folder ───────────────────────────────────────────────────────────────
+@app.post("/api/dataflows/folders")
+async def save_df_folder(payload: dict = {}):
+    fid  = payload.get("id","").strip()
+    name = payload.get("name","").strip()
+    if not fid or not name:
+        return {"error": "id and name required"}
+    try:
+        conn = get_connection()
+        _ensure_uploads_schema(conn)
+        _ensure_dataflows_tables(conn)
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM wz_uploads._df_folders WHERE id=%s", [fid])
+        if cur.fetchone():
+            cur.execute("UPDATE wz_uploads._df_folders SET name=%s, parent=%s WHERE id=%s",
+                        [name, payload.get("parent"), fid])
+        else:
+            cur.execute("INSERT INTO wz_uploads._df_folders (id,name,parent,sort_order) VALUES (%s,%s,%s,%s)",
+                        [fid, name, payload.get("parent"), payload.get("sort_order",0)])
+        conn.commit(); cur.close(); conn.close()
+        return {"saved": fid}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── Delete folder ─────────────────────────────────────────────────────────────
+@app.delete("/api/dataflows/folders/{folder_id}")
+def delete_df_folder(folder_id: str):
+    try:
+        conn = get_connection()
+        _ensure_uploads_schema(conn)
+        _ensure_dataflows_tables(conn)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM wz_uploads._df_folders WHERE id=%s", [folder_id])
+        # Reassign child dataflows to root
+        cur.execute("UPDATE wz_uploads._dataflows SET folder_id='f_root' WHERE folder_id=%s", [folder_id])
+        conn.commit(); cur.close(); conn.close()
+        return {"deleted": folder_id}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── Run a dataflow by ID ──────────────────────────────────────────────────────
+@app.post("/api/dataflows/{df_id}/run")
+async def run_dataflow_by_id(df_id: str):
+    """
+    Convenience endpoint: load dataflow from DB, run its checks,
+    update last_run_at and last_run_status.
+    """
+    try:
+        conn = get_connection()
+        _ensure_uploads_schema(conn)
+        _ensure_dataflows_tables(conn)
+        rows = q(conn, "SELECT checks_json, db_key FROM wz_uploads._dataflows WHERE id=%s", [df_id])
+        conn.close()
+        if not rows:
+            return {"error": "Dataflow not found"}
+
+        checks = _json.loads(rows[0].get("checks_json") or "[]")
+        db_key = rows[0].get("db_key","default")
+
+        # Re-use existing run-checks logic
+        from fastapi.encoders import jsonable_encoder
+        result = await run_monitor_checks({"checks": checks, "db_key": db_key})
+
+        # Update last run metadata
+        conn2 = get_connection()
+        cur   = conn2.cursor()
+        cur.execute("""
+            UPDATE wz_uploads._dataflows
+            SET last_run_at=GETDATE(), last_run_status=%s
+            WHERE id=%s
+        """, [result.get("overall","error"), df_id])
+        conn2.commit(); cur.close(); conn2.close()
+
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SCHEDULER ROUTES — persist schedules + trigger on cron
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_SCHEDULES: dict = {}  # { id: schedule_dict }
+
+def _ensure_schedules_table(conn):
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS wz_uploads._schedules (
+            id              VARCHAR(64) PRIMARY KEY,
+            name            VARCHAR(512),
+            schedule        VARCHAR(256),
+            workflow_ids    VARCHAR(4096),
+            dataflow_ids    VARCHAR(4096),
+            owner           VARCHAR(256),
+            enabled         BOOLEAN DEFAULT TRUE,
+            slack_channel   VARCHAR(512),
+            notes           VARCHAR(2048),
+            last_triggered  TIMESTAMP,
+            last_status     VARCHAR(32),
+            created_at      TIMESTAMP DEFAULT GETDATE(),
+            updated_at      TIMESTAMP DEFAULT GETDATE()
+        )
+    """)
+    conn.commit(); cur.close()
+
+def _load_schedules_from_db():
+    global _SCHEDULES
+    try:
+        conn = get_connection()
+        _ensure_uploads_schema(conn)
+        _ensure_schedules_table(conn)
+        rows = q(conn, "SELECT * FROM wz_uploads._schedules")
+        conn.close()
+        for r in rows:
+            sid = r["id"]
+            _SCHEDULES[sid] = {
+                "id":             sid,
+                "name":           r.get("name",""),
+                "schedule":       r.get("schedule","manual"),
+                "workflow_ids":   json.loads(r.get("workflow_ids") or "[]"),
+                "dataflow_ids":   json.loads(r.get("dataflow_ids") or "[]"),
+                "owner":          r.get("owner",""),
+                "enabled":        bool(r.get("enabled", True)),
+                "slack_channel":  r.get("slack_channel",""),
+                "notes":          r.get("notes",""),
+                "last_triggered": str(r["last_triggered"]) if r.get("last_triggered") else None,
+                "last_status":    r.get("last_status"),
+                "created_at":     str(r["created_at"]) if r.get("created_at") else None,
+                "updated_at":     str(r["updated_at"]) if r.get("updated_at") else None,
+            }
+    except Exception:
+        pass
+
+# Load on startup
+try:
+    _load_schedules_from_db()
+except Exception:
+    pass
+
+
+@app.get("/api/schedules")
+def list_schedules():
+    return list(_SCHEDULES.values())
+
+
+@app.post("/api/schedules")
+async def save_schedule(payload: dict = {}):
+    sid  = (payload.get("id") or "").strip()
+    name = (payload.get("name") or "").strip()
+    if not sid or not name:
+        return {"error": "id and name required"}
+    now = datetime.datetime.utcnow().isoformat()
+    existing = _SCHEDULES.get(sid, {})
+    sch = {
+        **existing,
+        "id":            sid,
+        "name":          name,
+        "schedule":      payload.get("schedule","manual"),
+        "workflow_ids":  payload.get("workflow_ids",[]),
+        "dataflow_ids":  payload.get("dataflow_ids",[]),
+        "owner":         payload.get("owner",""),
+        "enabled":       payload.get("enabled", True),
+        "slack_channel": payload.get("slack_channel",""),
+        "notes":         payload.get("notes",""),
+        "last_triggered":existing.get("last_triggered"),
+        "last_status":   existing.get("last_status"),
+        "created_at":    existing.get("created_at", now),
+        "updated_at":    now,
+    }
+    _SCHEDULES[sid] = sch
+    # Persist to Redshift
+    try:
+        conn = get_connection()
+        _ensure_uploads_schema(conn)
+        _ensure_schedules_table(conn)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM wz_uploads._schedules WHERE id=%s", [sid])
+        cur.execute("""
+            INSERT INTO wz_uploads._schedules
+                (id, name, schedule, workflow_ids, dataflow_ids, owner,
+                 enabled, slack_channel, notes, last_triggered, last_status)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, [
+            sid, name,
+            sch["schedule"],
+            json.dumps(sch["workflow_ids"]),
+            json.dumps(sch["dataflow_ids"]),
+            sch["owner"],
+            sch["enabled"],
+            sch["slack_channel"],
+            sch["notes"],
+            sch["last_triggered"],
+            sch["last_status"],
+        ])
+        conn.commit(); cur.close(); conn.close()
+    except Exception as e:
+        return {"saved": sid, "warn": str(e)}
+    return {"saved": sid}
+
+
+@app.delete("/api/schedules/{schedule_id}")
+def delete_schedule(schedule_id: str):
+    _SCHEDULES.pop(schedule_id, None)
+    try:
+        conn = get_connection()
+        _ensure_uploads_schema(conn)
+        _ensure_schedules_table(conn)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM wz_uploads._schedules WHERE id=%s", [schedule_id])
+        conn.commit(); cur.close(); conn.close()
+    except Exception:
+        pass
+    return {"deleted": schedule_id}
+
+
+@app.post("/api/schedules/{schedule_id}/run")
+async def run_schedule_now(schedule_id: str):
+    """Fire a schedule immediately — runs all its workflows and dataflows."""
+    sch = _SCHEDULES.get(schedule_id)
+    if not sch:
+        return {"error": "Schedule not found"}
+    results = []
+    for wf_id in (sch.get("workflow_ids") or []):
+        wf = _CUSTOM_WORKFLOWS.get(wf_id)
+        if not wf:
+            results.append({"type":"workflow","id":wf_id,"status":"not_found"})
+            continue
+        try:
+            if wf.get("checks"):
+                r = await _run_workflow_checks(wf, triggered_by="schedule")
+            else:
+                r = await _run_custom_workflow(wf, triggered_by="schedule")
+            results.append({"type":"workflow","id":wf_id,"name":wf["name"],"status":r.get("overall","error")})
+        except Exception as e:
+            results.append({"type":"workflow","id":wf_id,"status":"error","error":str(e)})
+    # Dataflows
+    for df_id in (sch.get("dataflow_ids") or []):
+        try:
+            conn = get_connection()
+            _ensure_uploads_schema(conn)
+            _ensure_dataflows_tables(conn)
+            rows = q(conn, "SELECT checks_json, db_key FROM wz_uploads._dataflows WHERE id=%s", [df_id])
+            conn.close()
+            if rows:
+                checks = json.loads(rows[0].get("checks_json") or "[]")
+                r = await run_monitor_checks({"checks": checks})
+                results.append({"type":"dataflow","id":df_id,"status":r.get("overall","error")})
+            else:
+                results.append({"type":"dataflow","id":df_id,"status":"not_found"})
+        except Exception as e:
+            results.append({"type":"dataflow","id":df_id,"status":"error","error":str(e)})
+    # Update last_triggered + status
+    now = datetime.datetime.utcnow().isoformat()
+    overall = "pass" if all(r.get("status") in ("pass","clean") for r in results) else "fail"
+    _SCHEDULES[schedule_id]["last_triggered"] = now
+    _SCHEDULES[schedule_id]["last_status"] = overall
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("UPDATE wz_uploads._schedules SET last_triggered=GETDATE(), last_status=%s WHERE id=%s",
+                    [overall, schedule_id])
+        conn.commit(); cur.close(); conn.close()
+    except Exception:
+        pass
+    return {"ran": len(results), "overall": overall, "results": results, "ran_at": now}
+
+
+@app.post("/api/schedules/cron-check")
+async def schedules_cron_check():
+    """
+    Called by the background scheduler every 60s.
+    Fires any schedule whose cron expression is due.
+    """
+    now_utc = datetime.datetime.utcnow()
+    fired = []
+    for sch in list(_SCHEDULES.values()):
+        if not sch.get("enabled", True): continue
+        sched = sch.get("schedule","")
+        if not sched or sched == "manual": continue
+        if _cron_is_due(sched, sch.get("last_triggered")):
+            r = await run_schedule_now(sch["id"])
+            fired.append({"id": sch["id"], "name": sch["name"], "result": r.get("overall")})
+    return {"fired": len(fired), "details": fired}
