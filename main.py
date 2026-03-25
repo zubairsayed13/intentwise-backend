@@ -2489,7 +2489,8 @@ def delete_custom_workflow(wf_id: str):
         _ensure_deleted_wf_table(conn)
         cur = conn.cursor()
         cur.execute("DELETE FROM wz_uploads._wf_registry WHERE wf_id=%s", [wf_id])
-        cur.execute("INSERT INTO wz_uploads._deleted_workflows (wf_id) VALUES (%s) ON CONFLICT (wf_id) DO NOTHING", [wf_id])
+        cur.execute("DELETE FROM wz_uploads._deleted_workflows WHERE wf_id=%s", [wf_id])
+        cur.execute("INSERT INTO wz_uploads._deleted_workflows (wf_id) VALUES (%s)", [wf_id])
         conn.commit(); cur.close(); conn.close()
     except Exception:
         pass
@@ -5278,7 +5279,7 @@ def _ensure_deleted_wf_table(conn):
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS wz_uploads._deleted_workflows (
-            wf_id VARCHAR(128) PRIMARY KEY,
+            wf_id      VARCHAR(128),
             deleted_at TIMESTAMP DEFAULT GETDATE()
         )
     """)
@@ -5743,7 +5744,20 @@ async def _master_startup():
         except Exception: pass
         try: _load_sop_runs()
         except Exception: pass
-        try: _load_deleted_wf_ids()
+        try:
+            # Recreate _deleted_workflows without PRIMARY KEY (Redshift-safe)
+            try:
+                conn = get_connection()
+                _ensure_uploads_schema(conn)
+                cur = conn.cursor()
+                # Drop and recreate to remove any invalid PRIMARY KEY constraint
+                cur.execute("DROP TABLE IF EXISTS wz_uploads._deleted_workflows")
+                cur.execute("""CREATE TABLE wz_uploads._deleted_workflows (
+                    wf_id VARCHAR(128), deleted_at TIMESTAMP DEFAULT GETDATE()
+                )""")
+                conn.commit(); cur.close(); conn.close()
+            except Exception: pass
+            _load_deleted_wf_ids()
         except Exception: pass
         try: _load_sop_schedules()
         except Exception: pass
