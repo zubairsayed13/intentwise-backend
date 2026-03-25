@@ -106,15 +106,6 @@ async def _proactive_anomaly_check():
     except Exception:
         pass
 
-_proactive_alerts: list = []   # visible to frontend via /api/anomaly/proactive
-
-@app.get("/api/anomaly/proactive")
-def get_proactive_alerts():
-    """Return latest proactive anomaly alerts for frontend toast/badge."""
-    return {"alerts": _proactive_alerts, "last_run": _anomaly_last_run,
-            "baseline_metrics": list(_anomaly_baseline.keys())}
-
-
 async def _background_scheduler():
     """
     Internal scheduler — runs every 60s inside the backend process.
@@ -149,6 +140,14 @@ async def lifespan(app):
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+_proactive_alerts: list = []   # visible to frontend via /api/anomaly/proactive
+
+@app.get("/api/anomaly/proactive")
+def get_proactive_alerts():
+    """Return latest proactive anomaly alerts for frontend toast/badge."""
+    return {"alerts": _proactive_alerts, "last_run": _anomaly_last_run,
+            "baseline_metrics": list(_anomaly_baseline.keys())}
 
 # ── Connection Registry ──────────────────────────────────────────────────────
 # Supports multiple databases. Each db_key maps to a set of env vars.
