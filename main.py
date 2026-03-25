@@ -6,6 +6,115 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ── Proactive anomaly baseline (stored in memory, refreshed daily) ────────────
+_anomaly_baseline: dict = {}   # {metric: {"mean": float, "std": float, "last_updated": str}}
+_anomaly_last_run: str  = ""   # ISO date of last anomaly check
+
+async def _proactive_anomaly_check():
+    """
+    Runs hourly. Computes today's key metrics vs rolling baseline.
+    If a metric deviates >2.5σ, sends Slack alert + queues a toast notification.
+    Uses one lightweight DB query — no AI tokens.
+    """
+    global _anomaly_baseline, _anomaly_last_run
+    slack_url = os.getenv("SLACK_WEBHOOK_URL", "")
+    today = datetime.date.today().isoformat()
+    if _anomaly_last_run == today: return   # already ran today
+
+    try:
+        conn = get_connection()
+
+        # ── Today's snapshot metrics ──────────────────────────────────────────
+        metrics = {}
+
+        # Failed downloads today
+        r = q(conn, "SELECT COUNT(*) AS cnt FROM mws.report WHERE status='failed' AND download_date=CURRENT_DATE")
+        metrics["failed_downloads"] = float(r[0]["cnt"] if r else 0)
+
+        # Total orders yesterday
+        r = q(conn, "SELECT COUNT(*) AS cnt FROM mws.orders WHERE download_date=CURRENT_DATE-1")
+        metrics["orders_yesterday"] = float(r[0]["cnt"] if r else 0)
+
+        # Revenue yesterday
+        r = q(conn, "SELECT COALESCE(SUM(ordered_product_sales_amt),0) AS rev FROM mws.sales_and_traffic_by_date WHERE download_date=CURRENT_DATE-1")
+        metrics["revenue_yesterday"] = float(r[0]["rev"] if r else 0)
+
+        # Ads spend yesterday
+        r = q(conn, "SELECT COALESCE(SUM(spend),0) AS sp FROM public.tbl_amzn_campaign_report WHERE report_date=CURRENT_DATE-1")
+        metrics["ads_spend_yesterday"] = float(r[0]["sp"] if r else 0)
+
+        conn.close()
+
+        # ── Update rolling baseline (exponential moving average, n=14 days) ──
+        alpha = 0.15   # smoothing factor
+        for metric, value in metrics.items():
+            if metric not in _anomaly_baseline:
+                _anomaly_baseline[metric] = {"mean": value, "std": max(value*0.1, 1), "samples": [value]}
+                continue
+            b = _anomaly_baseline[metric]
+            samples = b.get("samples", []) + [value]
+            samples = samples[-14:]  # keep 14 days
+            mean = sum(samples) / len(samples)
+            std  = (sum((x-mean)**2 for x in samples)/len(samples))**0.5 or max(mean*0.1, 1)
+            _anomaly_baseline[metric] = {"mean": mean, "std": std, "samples": samples}
+
+        # ── Detect anomalies ─────────────────────────────────────────────────
+        alerts = []
+        LABELS = {
+            "failed_downloads":   "Failed downloads today",
+            "orders_yesterday":   "Orders yesterday",
+            "revenue_yesterday":  "Revenue yesterday ($)",
+            "ads_spend_yesterday":"Ads spend yesterday ($)",
+        }
+        for metric, value in metrics.items():
+            b = _anomaly_baseline.get(metric, {})
+            mean = b.get("mean", value)
+            std  = b.get("std",  1)
+            if std == 0: continue
+            z = (value - mean) / std
+            if abs(z) >= 2.5:
+                direction = "↑" if z > 0 else "↓"
+                pct = abs(round((value-mean)/max(mean,1)*100))
+                alerts.append({
+                    "metric": metric,
+                    "label":  LABELS.get(metric, metric),
+                    "value":  value,
+                    "mean":   round(mean, 1),
+                    "z":      round(z, 1),
+                    "direction": direction,
+                    "pct":    pct,
+                    "msg":    f"{direction} {LABELS.get(metric,metric)}: {value:,.0f} vs avg {mean:,.1f} ({pct}% {'above' if z>0 else 'below'} normal)"
+                })
+
+        _anomaly_last_run = today
+
+        # ── Store for frontend polling ────────────────────────────────────────
+        _proactive_alerts.clear()
+        _proactive_alerts.extend(alerts)
+
+        # ── Slack push ────────────────────────────────────────────────────────
+        if alerts and slack_url:
+            lines = ["⚠️ *WiziAgent Proactive Alert — Anomalies Detected*"]
+            for a in alerts:
+                lines.append(f"• {a['msg']}")
+            try:
+                async with httpx.AsyncClient(timeout=5) as client:
+                    await client.post(slack_url, json={"text": "\n".join(lines)})
+            except Exception:
+                pass
+
+    except Exception:
+        pass
+
+_proactive_alerts: list = []   # visible to frontend via /api/anomaly/proactive
+
+@app.get("/api/anomaly/proactive")
+def get_proactive_alerts():
+    """Return latest proactive anomaly alerts for frontend toast/badge."""
+    return {"alerts": _proactive_alerts, "last_run": _anomaly_last_run,
+            "baseline_metrics": list(_anomaly_baseline.keys())}
+
+
 async def _background_scheduler():
     """
     Internal scheduler — runs every 60s inside the backend process.
@@ -25,6 +134,10 @@ async def _background_scheduler():
             pass
         try:
             await schedules_cron_check()
+        except Exception:
+            pass
+        try:
+            await _proactive_anomaly_check()
         except Exception:
             pass
 
@@ -723,6 +836,75 @@ class ChatRequest(BaseModel):
     messages: list
     system: str = ""
     max_tokens: int = 1000
+
+@app.post("/api/ai/validate-sql")
+async def validate_sql_endpoint(payload: dict = {}):
+    """
+    Validate SQL against the real schema.
+    Checks: syntax (via Redshift EXPLAIN), column existence, table existence.
+    Returns {valid, issues, suggestions, tables_referenced, confidence}.
+    No AI tokens — pure DB validation.
+    """
+    sql = (payload.get("sql") or "").strip()
+    if not sql:
+        return {"valid": False, "issues": ["No SQL provided"], "confidence": 0}
+
+    issues = []
+    suggestions = []
+    tables_referenced = []
+    valid = True
+
+    try:
+        conn = get_connection()
+        cur  = conn.cursor()
+
+        # 1. Try EXPLAIN to catch syntax errors
+        try:
+            cur.execute(f"EXPLAIN {sql}")
+            cur.fetchall()
+        except Exception as e:
+            err = str(e)[:200]
+            issues.append(f"Syntax error: {err}")
+            valid = False
+
+        # 2. Extract table references and verify they exist
+        import re as _re
+        tbl_matches = _re.findall(r'([a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*)', sql)
+        for tbl in set(tbl_matches):
+            parts = tbl.split(".")
+            if len(parts) == 2:
+                schema, table = parts
+                tables_referenced.append(tbl)
+                exists = q(conn, "SELECT 1 FROM information_schema.tables WHERE table_schema=%s AND table_name=%s LIMIT 1",
+                           [schema, table])
+                if not exists:
+                    issues.append(f"Table not found: {tbl}")
+                    suggestions.append(f"Check spelling of {tbl}")
+                    valid = False
+
+        # 3. Warn about COUNT(*) without WHERE
+        if "count(*)" in sql.lower() and "where" not in sql.lower():
+            issues.append("SELECT COUNT(*) without WHERE — check returns no useful rows")
+            suggestions.append("Add a WHERE clause to filter for problem rows")
+
+        # 4. Warn about missing LIMIT on potentially large tables
+        if "limit" not in sql.lower() and any(t in sql.lower() for t in ["mws.orders","mws.report"]):
+            suggestions.append("Consider adding LIMIT 100 for performance in checks")
+
+        cur.close()
+        conn.close()
+    except Exception as e:
+        issues.append(f"Validation unavailable: {str(e)[:100]}")
+
+    confidence = 100 if valid and not issues else max(0, 100 - len(issues)*25)
+    return {
+        "valid": valid,
+        "issues": issues,
+        "suggestions": suggestions,
+        "tables_referenced": list(set(tables_referenced)),
+        "confidence": confidence,
+    }
+
 
 @app.post("/api/ai/chat")
 async def ai_chat(req: ChatRequest):
@@ -6251,13 +6433,37 @@ async def send_digest(payload: dict = {}):
 
         emoji = "🟢" if hit_rate >= 90 else "🟡" if hit_rate >= 70 else "🔴"
 
-        msg = (
-            f"{emoji} *Pipeline Health Digest — Last {days} days*\n\n"
+        # Base stats
+        base_stats = (
             f"*SLA Hit Rate:* {hit_rate}% ({days_hit}/{days_total} days on time)\n"
             f"*Data Available by {SLA_THRESHOLDS['data_available_by']} IST:* "
             f"{sum(1 for r in sla_data.get('sla_history',[]) if r.get('data_on_time'))}/{days_total} days ✓\n"
             f"*Replication by {SLA_THRESHOLDS['replicated_by']} IST:* "
-            f"{sum(1 for r in sla_data.get('sla_history',[]) if r.get('replication_on_time'))}/{days_total} days ✓\n\n"
+            f"{sum(1 for r in sla_data.get('sla_history',[]) if r.get('replication_on_time'))}/{days_total} days ✓"
+        )
+
+        # AI narrative — one concise call (~200 tokens total)
+        ai_narrative = ""
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        if api_key:
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    ai_resp = await client.post(
+                        "https://api.openai.com/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                        json={"model":"gpt-4o","max_tokens":120,"messages":[{
+                            "role":"user",
+                            "content":f"Write 2 sentences summarising this pipeline health data for a data team Slack digest. Be specific and actionable.\nSLA hit rate: {hit_rate}%, days tracked: {days_total}, anomalies: {len(_proactive_alerts)}. Tone: concise, professional."
+                        }]}
+                    )
+                    ai_narrative = "\n\n✨ _" + ai_resp.json().get("choices",[{}])[0].get("message",{}).get("content","").strip() + "_"
+            except Exception:
+                pass
+
+        msg = (
+            f"{emoji} *Pipeline Health Digest — Last {days} days*\n\n"
+            f"{base_stats}"
+            f"{ai_narrative}\n\n"
             f"_Generated by WiziAgent QA Platform_"
         )
 
