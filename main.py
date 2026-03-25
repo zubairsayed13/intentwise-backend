@@ -3839,13 +3839,52 @@ async def toggle_sop_schedule(sid: str):
 
 DEMO_ACCOUNT_IDS = [46, 3038]
 
-MWS_DEMO_TABLES = [
-    {"table": "mws.orders",                    "date_col": "purchase_date",  "label": "Orders"},
-    {"table": "mws.report",                    "date_col": "download_date",  "label": "Reports"},
-    {"table": "mws.inventory",                 "date_col": "snapshot_date",  "label": "Inventory"},
-    {"table": "mws.sales_and_traffic_by_date", "date_col": "sale_date",      "label": "Sales by Date"},
-    {"table": "mws.sales_and_traffic_by_asin", "date_col": "sale_date",      "label": "Sales by ASIN"},
+_DEMO_TABLES_DEFAULT = [
+    {"table": "mws.orders",                    "date_col": "purchase_date",  "label": "Orders",         "enabled": True,  "max_age_days": 7},
+    {"table": "mws.report",                    "date_col": "download_date",  "label": "Reports",        "enabled": True,  "max_age_days": 3},
+    {"table": "mws.inventory",                 "date_col": "snapshot_date",  "label": "Inventory",      "enabled": True,  "max_age_days": 7},
+    {"table": "mws.sales_and_traffic_by_date", "date_col": "sale_date",      "label": "Sales by Date",  "enabled": True,  "max_age_days": 7},
+    {"table": "mws.sales_and_traffic_by_asin", "date_col": "sale_date",      "label": "Sales by ASIN",  "enabled": True,  "max_age_days": 7},
 ]
+MWS_DEMO_TABLES = list(_DEMO_TABLES_DEFAULT)   # mutable at runtime
+
+def _ensure_demo_config_table(conn):
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS wz_uploads._demo_config (
+            key        VARCHAR(64) PRIMARY KEY,
+            value_json VARCHAR(MAX),
+            updated_at TIMESTAMP DEFAULT GETDATE()
+        )
+    """)
+    conn.commit(); cur.close()
+
+def _load_demo_config(db_key="default"):
+    global MWS_DEMO_TABLES, DEMO_ACCOUNT_IDS
+    try:
+        conn = get_connection(db_key)
+        _ensure_uploads_schema(conn)
+        _ensure_demo_config_table(conn)
+        rows = q(conn, "SELECT key, value_json FROM wz_uploads._demo_config")
+        conn.close()
+        for r in rows:
+            if r["key"] == "tables":
+                MWS_DEMO_TABLES = json.loads(r["value_json"])
+            elif r["key"] == "account_ids":
+                DEMO_ACCOUNT_IDS = json.loads(r["value_json"])
+    except Exception: pass
+
+def _save_demo_config(key: str, value, db_key="default"):
+    try:
+        conn = get_connection(db_key)
+        _ensure_uploads_schema(conn)
+        _ensure_demo_config_table(conn)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM wz_uploads._demo_config WHERE key=%s", [key])
+        cur.execute("INSERT INTO wz_uploads._demo_config (key, value_json) VALUES (%s,%s)",
+                    [key, json.dumps(value)])
+        conn.commit(); cur.close(); conn.close()
+    except Exception: pass
 
 @app.get("/api/demo/check")
 async def run_demo_check():
@@ -3861,9 +3900,10 @@ async def run_demo_check():
     overall_status = "pass"
 
     for tdef in MWS_DEMO_TABLES:
+        if not tdef.get("enabled", True): continue   # skip disabled tables
         tbl      = tdef["table"]
-        date_col = tdef["date_col"]
-        label    = tdef["label"]
+        date_col = tdef.get("date_col") or ""
+        label    = tdef.get("label", tbl)
         entry = {
             "table": tbl, "label": label, "date_col": date_col,
             "status": "pass", "issues": [],
@@ -3939,14 +3979,16 @@ async def run_demo_check():
                 entry["issues"].append(f"Missing account(s): {missing_accts}")
                 if overall_status == "pass": overall_status = "warn"
 
+            max_age  = int(tdef.get("max_age_days", 7))
+            warn_age = max(1, max_age // 2)
             if entry["days_since_max"] is not None:
-                if entry["days_since_max"] > 7:
+                if entry["days_since_max"] > max_age:
                     entry["status"] = "fail"
-                    entry["issues"].append(f"Data is {entry['days_since_max']} days old (max date: {entry['max_date']})")
+                    entry["issues"].append(f"Data is {entry['days_since_max']}d old — threshold: {max_age}d (max date: {entry['max_date']})")
                     overall_status = "fail"
-                elif entry["days_since_max"] > 3:
+                elif entry["days_since_max"] > warn_age:
                     if entry["status"] == "pass": entry["status"] = "warn"
-                    entry["issues"].append(f"Data is {entry['days_since_max']} days old — check freshness")
+                    entry["issues"].append(f"Data is {entry['days_since_max']}d old — approaching {max_age}d threshold")
                     if overall_status == "pass": overall_status = "warn"
 
         except Exception as e:
@@ -3979,6 +4021,100 @@ async def run_demo_check():
         "demo_accounts": DEMO_ACCOUNT_IDS,
         "results": results,
     }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DEMO VALIDATION CONFIG
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/demo/config")
+def get_demo_config():
+    """Return current demo validation table config."""
+    return {
+        "tables": MWS_DEMO_TABLES,
+        "account_ids": DEMO_ACCOUNT_IDS,
+    }
+
+@app.post("/api/demo/config")
+async def save_demo_config_endpoint(payload: dict = {}):
+    """Save demo validation config (tables list and/or account IDs)."""
+    global MWS_DEMO_TABLES, DEMO_ACCOUNT_IDS
+    import threading as _td
+    if "tables" in payload:
+        MWS_DEMO_TABLES = payload["tables"]
+        _td.Thread(target=_save_demo_config, args=("tables", MWS_DEMO_TABLES), daemon=True).start()
+    if "account_ids" in payload:
+        DEMO_ACCOUNT_IDS = payload["account_ids"]
+        _td.Thread(target=_save_demo_config, args=("account_ids", DEMO_ACCOUNT_IDS), daemon=True).start()
+    return {"saved": True, "tables": MWS_DEMO_TABLES, "account_ids": DEMO_ACCOUNT_IDS}
+
+@app.get("/api/demo/mws-tables")
+def list_mws_tables():
+    """List all tables in the mws schema with their columns, for the config UI."""
+    try:
+        conn = get_connection()
+        rows = q(conn, """
+            SELECT t.table_name,
+                   array_agg(c.column_name ORDER BY c.ordinal_position) AS columns
+            FROM information_schema.tables t
+            JOIN information_schema.columns c
+              ON c.table_schema = t.table_schema AND c.table_name = t.table_name
+            WHERE t.table_schema = 'mws'
+              AND t.table_type = 'BASE TABLE'
+            GROUP BY t.table_name
+            ORDER BY t.table_name
+        """)
+        conn.close()
+        return {"tables": [{"table": f"mws.{r['table_name']}",
+                            "name": r["table_name"],
+                            "columns": list(r["columns"]) if r["columns"] else []} for r in rows]}
+    except Exception as e:
+        # Fallback: return known tables
+        return {"tables": [
+            {"table": "mws.orders",                    "name": "orders",                    "columns": ["amazon_order_id","asin","status","purchase_date","item_price","quantity"]},
+            {"table": "mws.report",                    "name": "report",                    "columns": ["report_type","status","download_date","copy_status","requested_date"]},
+            {"table": "mws.inventory",                 "name": "inventory",                 "columns": ["asin","available","reserved","inbound","snapshot_date"]},
+            {"table": "mws.sales_and_traffic_by_date", "name": "sales_and_traffic_by_date", "columns": ["sale_date","ordered_revenue","ordered_units","sessions"]},
+            {"table": "mws.sales_and_traffic_by_asin", "name": "sales_and_traffic_by_asin", "columns": ["asin","sale_date","ordered_revenue","buy_box_prcntg"]},
+        ], "error": str(e)}
+
+@app.post("/api/demo/ai-suggest")
+async def demo_ai_suggest(payload: dict = {}):
+    """
+    Use AI to suggest date column and max_age_days for a given mws table.
+    Body: { "table": "mws.orders", "columns": ["col1","col2",...] }
+    """
+    table   = payload.get("table","")
+    columns = payload.get("columns", [])
+    api_key = os.environ.get("OPENAI_API_KEY","")
+    if not api_key:
+        return {"error": "OPENAI_API_KEY not set"}
+
+    prompt = f"""Table: {table}
+Columns: {", ".join(columns)}
+
+This is an ecommerce analytics table in Amazon Seller data (MWS/Redshift).
+Suggest:
+1. The best date column to use for freshness checking (the column that represents when data was ingested or when the event occurred)
+2. A sensible max_age_days threshold (how many days old is too old for demo data to be valid)
+3. A short human-readable label for this table
+
+Respond ONLY with JSON: {{"date_col":"column_name","max_age_days":7,"label":"Human Label","reason":"brief explanation"}}"""
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"model":"gpt-4o","max_tokens":200,
+                      "messages":[{"role":"user","content":prompt}]}
+            )
+            body = r.json()
+            text = body.get("choices",[{}])[0].get("message",{}).get("content","")
+            result = json.loads(text.replace("```json","").replace("```","").strip())
+            return result
+    except Exception as e:
+        return {"error": str(e)}
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # EVAL FRAMEWORK
@@ -5611,6 +5747,8 @@ async def _master_startup():
         except Exception: pass
         try: _load_sop_schedules()
         except Exception: pass
+        try: _load_demo_config()
+        except Exception: pass
         # Upgrade run_log column if it's still VARCHAR(65535)
         try:
             conn = get_connection()
@@ -6218,19 +6356,56 @@ async def get_full_check_results(
         conn = get_connection(run.get("db_key") or db_key)
         cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-        # Count total
-        count_sql = f"SELECT COUNT(*) AS total FROM ({sql}) _sub"
+        # Step 1: Get column names by fetching LIMIT 1 (works even for complex SQL)
+        cols = []
         try:
-            cur.execute(count_sql)
-            total_rows = cur.fetchone()["total"]
+            cur.execute(f"SELECT * FROM ({sql}) _sub LIMIT 1")
+            if cur.description:
+                cols = [d[0] for d in cur.description]
+            cur.fetchall()  # drain
         except Exception:
-            total_rows = None
+            pass
 
-        # Paginated fetch
+        # Step 2: Count total rows (wrap safely)
+        total_rows = None
+        try:
+            cur.execute(f"SELECT COUNT(*) AS total FROM ({sql}) _sub")
+            row = cur.fetchone()
+            total_rows = int(row["total"]) if row else 0
+        except Exception:
+            # Fallback: execute full query and count client-side
+            try:
+                cur.execute(sql)
+                all_rows = cur.fetchall()
+                total_rows = len(all_rows)
+                if not cols and cur.description:
+                    cols = [d[0] for d in cur.description]
+                cur.close()
+                row_dicts = [dict(r) for r in all_rows[offset:offset+limit]]
+                # Skip the paginated fetch below
+                conn.close()
+                note = (_run_notes.get(run_id) or {}).get(check_id, "")
+                return {
+                    "run_id": run_id, "check_id": check_id,
+                    "check_name": check.get("name",""), "sql": sql,
+                    "pass_condition": check.get("pass_condition",""),
+                    "passed": check.get("passed"), "severity": check.get("severity","high"),
+                    "columns": cols, "rows": row_dicts,
+                    "total_rows": total_rows, "fetched": len(row_dicts),
+                    "offset": offset, "limit": limit, "stats": {},
+                    "source_context": {}, "note": note,
+                    "run_started_at": run.get("started_at",""),
+                    "workflow_name": run.get("workflow_name",""),
+                }
+            except Exception as e2:
+                total_rows = None
+
+        # Step 3: Paginated fetch
         paged_sql = f"SELECT * FROM ({sql}) _sub LIMIT {limit} OFFSET {offset}"
         cur.execute(paged_sql)
         rows_out = cur.fetchall()
-        cols     = [d[0] for d in cur.description] if cur.description else []
+        if not cols and cur.description:
+            cols = [d[0] for d in cur.description]
         cur.close()
 
         row_dicts = [dict(r) for r in rows_out]
