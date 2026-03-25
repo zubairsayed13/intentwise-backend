@@ -198,11 +198,16 @@ def get_tables():
 def preview_table(schema: str = Query(...), table: str = Query(...), limit: int = 50):
     try:
         conn = get_connection()
-        columns = q(conn, "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema=%s AND table_name=%s ORDER BY ordinal_position", (schema, table))
+        col_rows  = q(conn, "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema=%s AND table_name=%s ORDER BY ordinal_position", (schema, table))
+        columns   = [r["column_name"] for r in col_rows]   # flat string list
+        col_types = {r["column_name"]: r["data_type"] for r in col_rows}
         count_row = q(conn, f'SELECT COUNT(*) as count FROM "{schema}"."{table}"')
-        rows = q(conn, f'SELECT * FROM "{schema}"."{table}" LIMIT {limit}')
+        rows      = q(conn, f'SELECT * FROM "{schema}"."{table}" LIMIT {limit}')
         conn.close()
-        return {"schema": schema, "table": table, "total_rows": int(count_row[0]["count"]), "columns": columns, "rows": rows}
+        return {"schema": schema, "table": table,
+                "total_rows": int(count_row[0]["count"]),
+                "columns": columns, "column_types": col_types,
+                "rows": [dict(r) for r in rows]}
     except Exception as e:
         return {"error": str(e)}
 
@@ -3825,6 +3830,155 @@ async def toggle_sop_schedule(sid: str):
     _t4.Thread(target=_save_sop_schedule, args=(_SOP_SCHEDULES[sid],), daemon=True).start()
     return {"toggled": True, "enabled": _SOP_SCHEDULES[sid]["enabled"]}
 
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DEMO DATA VALIDATION
+# Checks mws schema tables for demo account presence and data freshness.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+DEMO_ACCOUNT_IDS = [46, 3038]
+
+MWS_DEMO_TABLES = [
+    {"table": "mws.orders",                    "date_col": "purchase_date",  "label": "Orders"},
+    {"table": "mws.report",                    "date_col": "download_date",  "label": "Reports"},
+    {"table": "mws.inventory",                 "date_col": "snapshot_date",  "label": "Inventory"},
+    {"table": "mws.sales_and_traffic_by_date", "date_col": "sale_date",      "label": "Sales by Date"},
+    {"table": "mws.sales_and_traffic_by_asin", "date_col": "sale_date",      "label": "Sales by ASIN"},
+]
+
+@app.get("/api/demo/check")
+async def run_demo_check():
+    """
+    Run comprehensive demo data validation across all mws tables.
+    For each table, checks:
+    1. Any demo account (46 or 3038) has data
+    2. Min / max date for demo accounts
+    3. Data freshness (days since max date)
+    """
+    results = []
+    acct_in = ", ".join(str(a) for a in DEMO_ACCOUNT_IDS)
+    overall_status = "pass"
+
+    for tdef in MWS_DEMO_TABLES:
+        tbl      = tdef["table"]
+        date_col = tdef["date_col"]
+        label    = tdef["label"]
+        entry = {
+            "table": tbl, "label": label, "date_col": date_col,
+            "status": "pass", "issues": [],
+            "total_rows": 0, "demo_rows": 0,
+            "min_date": None, "max_date": None,
+            "days_since_max": None, "accounts_found": [],
+        }
+        try:
+            conn = get_connection()
+
+            # 1. Total row count for demo accounts
+            r = q(conn, f"""
+                SELECT COUNT(*) AS cnt,
+                       COUNT(DISTINCT account_id) AS accts
+                FROM {tbl}
+                WHERE account_id IN ({acct_in})
+            """)
+            entry["demo_rows"] = int(r[0]["cnt"]) if r else 0
+
+            # 2. Which demo accounts are present
+            r2 = q(conn, f"""
+                SELECT DISTINCT account_id FROM {tbl}
+                WHERE account_id IN ({acct_in})
+            """)
+            entry["accounts_found"] = [int(row["account_id"]) for row in r2]
+
+            # 3. Date range for demo accounts
+            r3 = q(conn, f"""
+                SELECT MIN({date_col}) AS min_dt,
+                       MAX({date_col}) AS max_dt
+                FROM {tbl}
+                WHERE account_id IN ({acct_in})
+            """)
+            if r3 and r3[0]["max_dt"]:
+                entry["min_date"] = str(r3[0]["min_dt"])[:10] if r3[0]["min_dt"] else None
+                entry["max_date"] = str(r3[0]["max_dt"])[:10] if r3[0]["max_dt"] else None
+                # Days since max date
+                try:
+                    max_dt = datetime.date.fromisoformat(entry["max_date"])
+                    entry["days_since_max"] = (datetime.date.today() - max_dt).days
+                except Exception:
+                    pass
+
+            # 4. Per-account breakdown
+            r4 = q(conn, f"""
+                SELECT account_id,
+                       COUNT(*) AS rows,
+                       MIN({date_col}) AS min_dt,
+                       MAX({date_col}) AS max_dt
+                FROM {tbl}
+                WHERE account_id IN ({acct_in})
+                GROUP BY account_id
+                ORDER BY account_id
+            """)
+            entry["account_detail"] = [
+                {"account_id": int(row["account_id"]),
+                 "rows": int(row["rows"]),
+                 "min_date": str(row["min_dt"])[:10] if row["min_dt"] else None,
+                 "max_date": str(row["max_dt"])[:10] if row["max_dt"] else None}
+                for row in r4
+            ]
+
+            conn.close()
+
+            # 5. Determine status
+            missing_accts = [a for a in DEMO_ACCOUNT_IDS if a not in entry["accounts_found"]]
+            if entry["demo_rows"] == 0:
+                entry["status"] = "fail"
+                entry["issues"].append("No demo account data found in this table")
+                overall_status = "fail"
+            elif missing_accts:
+                entry["status"] = "warn"
+                entry["issues"].append(f"Missing account(s): {missing_accts}")
+                if overall_status == "pass": overall_status = "warn"
+
+            if entry["days_since_max"] is not None:
+                if entry["days_since_max"] > 7:
+                    entry["status"] = "fail"
+                    entry["issues"].append(f"Data is {entry['days_since_max']} days old (max date: {entry['max_date']})")
+                    overall_status = "fail"
+                elif entry["days_since_max"] > 3:
+                    if entry["status"] == "pass": entry["status"] = "warn"
+                    entry["issues"].append(f"Data is {entry['days_since_max']} days old — check freshness")
+                    if overall_status == "pass": overall_status = "warn"
+
+        except Exception as e:
+            entry["status"] = "error"
+            entry["issues"].append(str(e)[:120])
+            overall_status = "fail"
+
+        results.append(entry)
+
+    # Slack alert if any table is failing
+    if overall_status in ("fail", "warn"):
+        slack_url = os.getenv("SLACK_WEBHOOK_URL", "")
+        if slack_url:
+            failing = [r for r in results if r["status"] in ("fail","error")]
+            warn    = [r for r in results if r["status"] == "warn"]
+            msg_lines = ["⚠️ *Demo Data Validation Alert*"]
+            for r in failing:
+                msg_lines.append(f"✗ *{r['label']}* (`{r['table']}`): {'; '.join(r['issues'])}")
+            for r in warn:
+                msg_lines.append(f"⚠ *{r['label']}*: {'; '.join(r['issues'])}")
+            try:
+                async with httpx.AsyncClient(timeout=5) as client:
+                    await client.post(slack_url, json={"text": "\n".join(msg_lines)})
+            except Exception:
+                pass
+
+    return {
+        "status": overall_status,
+        "checked_at": datetime.datetime.utcnow().isoformat(),
+        "demo_accounts": DEMO_ACCOUNT_IDS,
+        "results": results,
+    }
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # EVAL FRAMEWORK
