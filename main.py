@@ -2476,11 +2476,15 @@ def list_custom_workflows_v2():
 def delete_custom_workflow(wf_id: str):
     """Delete a custom workflow by ID — removes from memory and Redshift."""
     _CUSTOM_WORKFLOWS.pop(wf_id, None)
+    _DELETED_WF_IDS.add(wf_id)
     try:
         conn = get_connection()
         _ensure_wf_tables(conn)
+        _ensure_uploads_schema(conn)
+        _ensure_deleted_wf_table(conn)
         cur = conn.cursor()
         cur.execute("DELETE FROM wz_uploads._wf_registry WHERE wf_id=%s", [wf_id])
+        cur.execute("INSERT INTO wz_uploads._deleted_workflows (wf_id) VALUES (%s) ON CONFLICT (wf_id) DO NOTHING", [wf_id])
         conn.commit(); cur.close(); conn.close()
     except Exception:
         pass
@@ -2927,6 +2931,91 @@ _IST_OFFSET = __import__("datetime").timezone(__import__("datetime").timedelta(h
 SOP_TRIGGER_TIME_IST = os.getenv("SOP_TRIGGER_TIME", "16:00")   # 4:00 PM IST default
 SOP_GATE_TIMEOUT_MIN = int(os.getenv("SOP_GATE_TIMEOUT_MIN", "30"))
 
+# ── SOP named schedules ────────────────────────────────────────────────────────
+_SOP_SCHEDULES: dict = {}  # { id: schedule_dict }
+
+def _ensure_sop_schedules_table(conn):
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS wz_uploads._sop_schedules (
+            id          VARCHAR(64) PRIMARY KEY,
+            sch_json    VARCHAR(MAX),
+            updated_at  TIMESTAMP DEFAULT GETDATE()
+        )
+    """)
+    conn.commit(); cur.close()
+
+def _load_sop_schedules(db_key="default"):
+    global _SOP_SCHEDULES
+    try:
+        conn = get_connection(db_key)
+        _ensure_uploads_schema(conn)
+        _ensure_sop_schedules_table(conn)
+        rows = q(conn, "SELECT sch_json FROM wz_uploads._sop_schedules")
+        conn.close()
+        for r in rows:
+            try:
+                s = json.loads(r["sch_json"])
+                _SOP_SCHEDULES[s["id"]] = s
+            except Exception: pass
+    except Exception: pass
+
+def _save_sop_schedule(sch: dict, db_key="default"):
+    try:
+        conn = get_connection(db_key)
+        _ensure_uploads_schema(conn)
+        _ensure_sop_schedules_table(conn)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM wz_uploads._sop_schedules WHERE id=%s", [sch["id"]])
+        cur.execute("INSERT INTO wz_uploads._sop_schedules (id, sch_json) VALUES (%s,%s)",
+                    [sch["id"], json.dumps(sch)])
+        conn.commit(); cur.close(); conn.close()
+    except Exception: pass
+
+def _delete_sop_schedule(sid: str, db_key="default"):
+    _SOP_SCHEDULES.pop(sid, None)
+    try:
+        conn = get_connection(db_key)
+        _ensure_uploads_schema(conn)
+        _ensure_sop_schedules_table(conn)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM wz_uploads._sop_schedules WHERE id=%s", [sid])
+        conn.commit(); cur.close(); conn.close()
+    except Exception: pass
+
+def _sop_schedule_should_run(sch: dict) -> bool:
+    """Return True if this schedule should fire right now (within the current cron minute)."""
+    if not sch.get("enabled", True): return False
+    now_ist = _ist_now()
+    today_str = now_ist.date().isoformat()
+    freq = sch.get("frequency", "daily")  # once | daily | weekly | weekdays
+
+    # Check if already ran today for this schedule
+    last_run = sch.get("last_run_date", "")
+    if last_run == today_str: return False
+
+    # Time match (within 2-minute window for cron granularity)
+    run_time = sch.get("run_time", "16:00")
+    try:
+        h, m = map(int, run_time.split(":"))
+        trigger = now_ist.replace(hour=h, minute=m, second=0, microsecond=0)
+        if abs((now_ist - trigger).total_seconds()) > 120: return False
+    except Exception: return False
+
+    # Frequency check
+    weekday = now_ist.strftime("%A").lower()  # monday, tuesday...
+    if freq == "once":
+        run_date = sch.get("run_date", "")
+        return run_date == today_str
+    elif freq == "daily":
+        return True
+    elif freq == "weekdays":
+        return weekday not in ("saturday", "sunday")
+    elif freq == "weekly":
+        run_day = sch.get("run_day", "monday").lower()
+        return weekday == run_day
+    return False
+
 # ── In-memory SOP state ───────────────────────────────────────────────────────
 _sop_runs: dict = {}          # { run_id: sop_state_dict }
 _sop_gate_store: dict = {}    # { token: { decision, event, gate_num, run_id } }
@@ -3003,6 +3092,9 @@ async def _sop_detection(run_id: str) -> dict:
                 if not sql: continue
                 try:
                     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+                    trace.append({"node":"check","ts":_ts(),
+                        "msg":f"Running: {name}","level":"info",
+                        "sql": sql[:120] + ("…" if len(sql)>120 else "")})
                     cur.execute(sql)
                     rows_out = cur.fetchmany(10)
                     cur.close()
@@ -3014,6 +3106,10 @@ async def _sop_detection(run_id: str) -> dict:
                         passed = eval(f"{actual} {parts[1]} {float(parts[2])}")
                     except Exception:
                         passed = rc > 0
+                    status_str = "PASS" if passed else "FAIL"
+                    trace.append({"node":"check","ts":_ts(),
+                        "msg":f"{name} → {status_str} ({rc} rows)",
+                        "level":"success" if passed else "warning"})
                     if not passed:
                         details.append({"check":name,"status":"FAIL","detail":f"{rc} rows (condition: {cond})"})
                         missing = True
@@ -3021,20 +3117,27 @@ async def _sop_detection(run_id: str) -> dict:
                         details.append({"check":name,"status":"PASS","detail":f"{rc} rows"})
                 except Exception as e:
                     details.append({"check":name,"status":"WARN","detail":str(e)[:80]})
+                    trace.append({"node":"check","ts":_ts(),"msg":f"{name} → WARN: {str(e)[:60]}","level":"warning"})
         else:
             # Default: check each ads table for n-1 data
             for tbl in ADS_TABLES:
                 short = tbl.split("tbl_amzn_")[1].replace("_report","") if "tbl_amzn_" in tbl else tbl
                 try:
+                    trace.append({"node":"check","ts":_ts(),
+                        "msg":f"Checking {short} for {n1_date}…","level":"info",
+                        "sql":f"SELECT COUNT(*) FROM {tbl} WHERE report_date = '{n1_date}'"})
                     r = q(conn, f"SELECT COUNT(*) AS cnt FROM {tbl} WHERE report_date = %s", [n1_date])
                     cnt = int(r[0]["cnt"]) if r else 0
                     if cnt == 0:
                         details.append({"check":f"{short} ({n1_date})","status":"FAIL","detail":"No data for n-1 date"})
                         missing = True
+                        trace.append({"node":"check","ts":_ts(),"msg":f"{short} → FAIL (0 rows for {n1_date})","level":"warning"})
                     else:
                         details.append({"check":f"{short} ({n1_date})","status":"PASS","detail":f"{cnt} rows"})
+                        trace.append({"node":"check","ts":_ts(),"msg":f"{short} → PASS ({cnt} rows)","level":"success"})
                 except Exception as e:
                     details.append({"check":short,"status":"WARN","detail":str(e)[:80]})
+                    trace.append({"node":"check","ts":_ts(),"msg":f"{short} → WARN: {str(e)[:60]}","level":"warning"})
         conn.close()
     except Exception as e:
         details.append({"check":"db_connection","status":"FAIL","detail":str(e)[:100]})
@@ -3060,13 +3163,13 @@ async def _sop_validation() -> dict:
         try:
             conn = get_connection()
             # n-1 account count
-            today_r = q(conn, f"SELECT COUNT(DISTINCT account_id) AS cnt FROM {tbl} WHERE report_date = %s", [n1])
+            today_r = q(conn, f"SELECT COUNT(DISTINCT profile_id) AS cnt FROM {tbl} WHERE report_date = %s", [n1])
             today_cnt = int(today_r[0]["cnt"]) if today_r else 0
 
             # 5-day baseline
             baseline_r = q(conn, f"""
                 SELECT AVG(daily_cnt) AS avg_cnt FROM (
-                    SELECT report_date, COUNT(DISTINCT account_id) AS daily_cnt
+                    SELECT report_date, COUNT(DISTINCT profile_id) AS daily_cnt
                     FROM {tbl}
                     WHERE report_date BETWEEN %s AND %s
                     GROUP BY report_date
@@ -3368,6 +3471,7 @@ async def _run_sop(run_id: str, gate_timeout_min: int = None):
     try:
         # ── Detection ─────────────────────────────────────────────────────────
         state["status"] = "detection"
+        trace.append({"node":"detection","ts":_ts(),"msg":"Starting detection checks…","level":"info"})
         update(await _sop_detection(run_id))
         if not state["detection_result"]["missing"] and not force_full:
             state["status"] = "complete_no_issues"
@@ -3632,30 +3736,94 @@ async def force_sop_gate(payload: dict = {}):
 @app.post("/api/workflow/sop-auto-trigger")
 async def sop_auto_trigger(payload: dict = {}):
     """
-    Called by cron. Auto-triggers SOP if:
-    1. Current IST time is past SOP_TRIGGER_TIME (default 4:00 PM)
-    2. No SOP has run today already
+    Called by cron every minute. Checks all SOP schedules and fires any that are due.
+    Also handles the legacy single trigger_time_ist config for backwards compatibility.
     """
     global _sop_today_run
+    triggered_any = []
+    ist_today = _ist_now().date().isoformat()
+
+    # ── Named schedules ────────────────────────────────────────────────────────
+    for sid, sch in list(_SOP_SCHEDULES.items()):
+        if not _sop_schedule_should_run(sch): continue
+        result = await start_ads_sop({
+            "gate_timeout_min": sch.get("gate_timeout_min", SOP_GATE_TIMEOUT_MIN),
+            "triggered_by_schedule": sid,
+        })
+        # Mark schedule last run
+        _SOP_SCHEDULES[sid]["last_run_date"] = ist_today
+        _SOP_SCHEDULES[sid]["last_run_id"]   = result["run_id"]
+        import threading as _t2
+        _t2.Thread(target=_save_sop_schedule, args=(_SOP_SCHEDULES[sid],), daemon=True).start()
+        triggered_any.append({"schedule_id": sid, "run_id": result["run_id"]})
+        _sop_today_run = result["run_id"]
+
+    if triggered_any:
+        return {"triggered": True, "runs": triggered_any}
+
+    # ── Legacy single trigger (trigger_time_ist in config) ─────────────────────
+    # Only fires if no named schedules are configured
+    if _SOP_SCHEDULES:
+        return {"triggered": False, "reason": "Using named schedules"}
+
     trigger_time = payload.get("trigger_time", _SOP_CONFIG.get("trigger_time_ist", SOP_TRIGGER_TIME_IST))
-    ist_today    = _ist_now().date().isoformat()
-
-    # Check if already ran today
-    if _sop_today_run and _sop_today_run in _sop_runs:
-        run = _sop_runs[_sop_today_run]
-        if run.get("started_at","")[:10] == ist_today:
-            return {"triggered": False, "reason": "SOP already ran today",
-                    "run_id": _sop_today_run}
-
+    if _sop_today_run and _sop_runs.get(_sop_today_run, {}).get("started_at","")[:10] == ist_today:
+        return {"triggered": False, "reason": "SOP already ran today"}
     if not _ist_past_time(trigger_time):
         return {"triggered": False,
                 "reason": f"Not yet {trigger_time} IST — current: {_ist_now().strftime('%H:%M')}"}
-
-    # Auto-trigger
     result = await start_ads_sop({"gate_timeout_min": SOP_GATE_TIMEOUT_MIN})
     _sop_today_run = result["run_id"]
     return {"triggered": True, "run_id": result["run_id"],
             "reason": f"Auto-triggered at {_ist_now().strftime('%H:%M')} IST"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SOP SCHEDULES CRUD
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/workflow/ads-sop/schedules")
+def get_sop_schedules():
+    """List all SOP schedules."""
+    return {"schedules": list(_SOP_SCHEDULES.values())}
+
+@app.post("/api/workflow/ads-sop/schedules")
+async def save_sop_schedule_endpoint(payload: dict = {}):
+    """Create or update a SOP schedule."""
+    sid = payload.get("id") or f"sopsch_{uuid.uuid4().hex[:8]}"
+    sch = {
+        "id":               sid,
+        "name":             payload.get("name", "Daily Check"),
+        "enabled":          payload.get("enabled", True),
+        "frequency":        payload.get("frequency", "daily"),   # once|daily|weekdays|weekly
+        "run_time":         payload.get("run_time", "16:00"),     # HH:MM IST
+        "run_date":         payload.get("run_date", ""),          # for frequency=once
+        "run_day":          payload.get("run_day", "monday"),     # for frequency=weekly
+        "gate_timeout_min": int(payload.get("gate_timeout_min", SOP_GATE_TIMEOUT_MIN)),
+        "created_at":       _SOP_SCHEDULES.get(sid, {}).get("created_at", datetime.datetime.utcnow().isoformat()),
+        "last_run_date":    _SOP_SCHEDULES.get(sid, {}).get("last_run_date", ""),
+        "last_run_id":      _SOP_SCHEDULES.get(sid, {}).get("last_run_id", ""),
+    }
+    _SOP_SCHEDULES[sid] = sch
+    import threading as _t3
+    _t3.Thread(target=_save_sop_schedule, args=(sch,), daemon=True).start()
+    return {"saved": True, "schedule": sch}
+
+@app.delete("/api/workflow/ads-sop/schedules/{sid}")
+def delete_sop_schedule_endpoint(sid: str):
+    """Delete a SOP schedule."""
+    _delete_sop_schedule(sid)
+    return {"deleted": True, "id": sid}
+
+@app.post("/api/workflow/ads-sop/schedules/{sid}/toggle")
+async def toggle_sop_schedule(sid: str):
+    """Enable or disable a schedule."""
+    if sid not in _SOP_SCHEDULES:
+        return {"error": "Not found"}
+    _SOP_SCHEDULES[sid]["enabled"] = not _SOP_SCHEDULES[sid].get("enabled", True)
+    import threading as _t4
+    _t4.Thread(target=_save_sop_schedule, args=(_SOP_SCHEDULES[sid],), daemon=True).start()
+    return {"toggled": True, "enabled": _SOP_SCHEDULES[sid]["enabled"]}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4768,7 +4936,7 @@ def _ensure_wf_tables(conn):
         CREATE TABLE IF NOT EXISTS wz_uploads._wf_run_log (
             run_id       VARCHAR(64),
             wf_id        VARCHAR(64),
-            run_json     VARCHAR(65535),
+            run_json     VARCHAR(MAX),
             started_at   TIMESTAMP DEFAULT GETDATE()
         )
     """)
@@ -4791,13 +4959,51 @@ def _persist_run(run: dict, db_key: str = "default"):
         conn = get_connection(db_key)
         _ensure_wf_tables(conn)
         cur  = conn.cursor()
+        # Strip sample_rows from check_results to keep JSON small (they're not needed for re-execution)
+        slim = {**run}
+        if slim.get("check_results"):
+            slim["check_results"] = [
+                {k: v for k, v in c.items() if k != "sample_rows"}
+                for c in slim["check_results"]
+            ]
+        run_json_str = json.dumps(slim, default=str)
+        # Redshift VARCHAR(65535) limit — truncation guard: if still too large, drop columns list too
+        if len(run_json_str) > 60000:
+            slim["check_results"] = [
+                {k: v for k, v in c.items() if k not in ("sample_rows", "columns")}
+                for c in (slim.get("check_results") or [])
+            ]
+            run_json_str = json.dumps(slim, default=str)
         # keep only last 200 runs per workflow in DB
         cur.execute("DELETE FROM wz_uploads._wf_run_log WHERE wf_id=%s AND run_id NOT IN (SELECT run_id FROM wz_uploads._wf_run_log WHERE wf_id=%s ORDER BY started_at DESC LIMIT 199)", [run["workflow_id"], run["workflow_id"]])
         cur.execute("INSERT INTO wz_uploads._wf_run_log (run_id, wf_id, run_json) VALUES (%s,%s,%s)",
-                    [run["run_id"], run["workflow_id"], json.dumps(run)])
+                    [run["run_id"], run["workflow_id"], run_json_str])
         conn.commit(); cur.close(); conn.close()
     except Exception:
         pass
+
+_DELETED_WF_IDS: set = set()   # persisted tombstone — never reload these
+
+def _ensure_deleted_wf_table(conn):
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS wz_uploads._deleted_workflows (
+            wf_id VARCHAR(128) PRIMARY KEY,
+            deleted_at TIMESTAMP DEFAULT GETDATE()
+        )
+    """)
+    conn.commit(); cur.close()
+
+def _load_deleted_wf_ids(db_key: str = "default"):
+    global _DELETED_WF_IDS
+    try:
+        conn = get_connection(db_key)
+        _ensure_uploads_schema(conn)
+        _ensure_deleted_wf_table(conn)
+        rows = q(conn, "SELECT wf_id FROM wz_uploads._deleted_workflows")
+        conn.close()
+        _DELETED_WF_IDS = {r["wf_id"] for r in rows}
+    except Exception: pass
 
 def _load_workflows_from_db(db_key: str = "default"):
     try:
@@ -4809,8 +5015,10 @@ def _load_workflows_from_db(db_key: str = "default"):
             for r in rows:
                 try:
                     wf = json.loads(r["wf_json"])
-                    if wf.get("id") and wf["id"] not in _CUSTOM_WORKFLOWS:
-                        _CUSTOM_WORKFLOWS[wf["id"]] = wf
+                    wid = wf.get("id")
+                    # Never reload deleted workflows
+                    if wid and wid not in _CUSTOM_WORKFLOWS and wid not in _DELETED_WF_IDS:
+                        _CUSTOM_WORKFLOWS[wid] = wf
                 except Exception: pass
         except Exception:
             conn.close()
@@ -5244,6 +5452,17 @@ async def _master_startup():
         try: _load_eval_history()
         except Exception: pass
         try: _load_sop_runs()
+        except Exception: pass
+        try: _load_deleted_wf_ids()
+        except Exception: pass
+        try: _load_sop_schedules()
+        except Exception: pass
+        # Upgrade run_log column if it's still VARCHAR(65535)
+        try:
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute("ALTER TABLE wz_uploads._wf_run_log ALTER COLUMN run_json VARCHAR(MAX)")
+            conn.commit(); cur.close(); conn.close()
         except Exception: pass
         try: _load_check_library()
         except Exception: pass
