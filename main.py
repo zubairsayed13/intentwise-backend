@@ -7712,6 +7712,39 @@ AGENT_TOOLS = [
             "parameters": {"type": "object", "properties": {}}
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_sla_status",
+            "description": "Get current SLA status — today's pipeline health, whether data is on time, hit rate.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_demo_status",
+            "description": "Get demo data validation status — which tables have fresh demo account data.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_schedule",
+            "description": "Create a new schedule to run workflows or dataflows at a set time.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name":         {"type": "string", "description": "Schedule name"},
+                    "schedule":     {"type": "string", "description": "e.g. 'daily', 'every 1 hour', 'every 30 min'"},
+                    "workflow_ids": {"type": "array",  "items": {"type": "string"}, "description": "List of workflow IDs to include"},
+                    "run_time":     {"type": "string", "description": "Time in HH:MM IST e.g. '16:30'"}
+                },
+                "required": ["name", "schedule"]
+            }
+        }
+    },
 ]
 
 
@@ -7835,6 +7868,57 @@ async def _execute_tool(tool_name: str, tool_args: dict) -> str:
                                 "enabled": s.get("enabled", True), "last_triggered": s.get("last_triggered"),
                                 "workflows": len(s.get("workflow_ids", [])),
                                 "dataflows": len(s.get("dataflow_ids", []))} for s in _SCHEDULES.values()])
+
+        elif tool_name == "get_sla_status":
+            try:
+                sla = await sla_history(days=7)
+                summary = sla.get("summary", {})
+                today   = sla.get("sla_history", [{}])[-1] if sla.get("sla_history") else {}
+                return json.dumps({
+                    "hit_rate_7d": summary.get("hit_rate_pct", 0),
+                    "days_on_time": summary.get("days_hit_sla", 0),
+                    "days_tracked": summary.get("days_tracked", 7),
+                    "today": {
+                        "data_on_time": today.get("data_on_time"),
+                        "replication_on_time": today.get("replication_on_time"),
+                        "data_arrival": today.get("data_available_time_ist"),
+                    },
+                    "thresholds": SLA_THRESHOLDS,
+                })
+            except Exception as e:
+                return json.dumps({"error": str(e)})
+
+        elif tool_name == "get_demo_status":
+            try:
+                result = await run_demo_check()
+                return json.dumps({
+                    "overall": result.get("status"),
+                    "tables": [{
+                        "label": r.get("label"), "table": r.get("table"),
+                        "status": r.get("status"),
+                        "days_since_max": r.get("days_since_max"),
+                        "demo_rows": r.get("demo_rows", 0),
+                        "issues": r.get("issues", []),
+                    } for r in result.get("results", [])]
+                })
+            except Exception as e:
+                return json.dumps({"error": str(e)})
+
+        elif tool_name == "create_schedule":
+            name         = tool_args.get("name", "New Schedule")
+            schedule     = tool_args.get("schedule", "daily")
+            workflow_ids = tool_args.get("workflow_ids", [])
+            run_time     = tool_args.get("run_time", "")
+            import uuid as _uuid
+            sch_id = f"sch_{_uuid.uuid4().hex[:8]}"
+            _SCHEDULES[sch_id] = {
+                "id": sch_id, "name": name, "schedule": schedule,
+                "workflow_ids": workflow_ids, "dataflow_ids": [],
+                "enabled": True, "run_time": run_time,
+                "created_at": datetime.datetime.utcnow().isoformat(),
+            }
+            return json.dumps({"created": sch_id, "name": name, "schedule": schedule,
+                               "workflow_ids": workflow_ids})
 
         else:
             return json.dumps({"error": f"Unknown tool: {tool_name}"})
