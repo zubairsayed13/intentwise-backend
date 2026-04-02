@@ -875,6 +875,7 @@ class ChatRequest(BaseModel):
     messages: list
     system: str = ""
     max_tokens: int = 1000
+    temperature: float = 0.7
 
 @app.post("/api/ai/validate-sql")
 async def validate_sql_endpoint(payload: dict = {}):
@@ -960,6 +961,7 @@ async def ai_chat(req: ChatRequest):
         payload = {
             "model": "gpt-4o",
             "max_tokens": req.max_tokens,
+            "temperature": req.temperature,
             "messages": messages,
         }
         r = await client.post(
