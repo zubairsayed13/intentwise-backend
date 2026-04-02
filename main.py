@@ -4,6 +4,14 @@ from fastapi.middleware.cors import CORSMiddleware
 import psycopg2, psycopg2.extras, os, httpx, json, asyncio, threading, datetime, uuid
 from dotenv import load_dotenv
 
+# ── RAG Runbooks + Slack AI integration ───────────────────────────────────────
+try:
+    from rag_runbooks import router as runbook_router
+    from slack_integration import router as slack_router
+    _ADDONS_LOADED = True
+except ImportError:
+    _ADDONS_LOADED = False
+
 load_dotenv()
 
 # ── Proactive anomaly baseline (stored in memory, refreshed daily) ────────────
@@ -131,6 +139,22 @@ async def _background_scheduler():
             await _proactive_anomaly_check()
         except Exception:
             pass
+        # Daily digest — fires once at configured hour
+        try:
+            DIGEST_HOUR = int(os.getenv("DIGEST_HOUR_UTC","17"))
+            now_utc = datetime.datetime.utcnow()
+            digest_key = f"digest_{now_utc.date().isoformat()}"
+            if (now_utc.hour == DIGEST_HOUR and now_utc.minute < 1
+                    and getattr(_background_scheduler, "_last_digest", None) != digest_key
+                    and _ADDONS_LOADED):
+                _background_scheduler._last_digest = digest_key
+                from slack_integration import send_digest
+                from fastapi import BackgroundTasks
+                bt = BackgroundTasks()
+                await send_digest(bt)
+                await bt()
+        except Exception:
+            pass
 
 async def lifespan(app):
     import asyncio as _asyncio
@@ -140,6 +164,11 @@ async def lifespan(app):
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# Register addon routers
+if _ADDONS_LOADED:
+    app.include_router(runbook_router)
+    app.include_router(slack_router)
 
 _proactive_alerts: list = []   # visible to frontend via /api/anomaly/proactive
 
@@ -5674,19 +5703,58 @@ async def _run_workflow_checks(wf: dict, triggered_by: str = "manual") -> dict:
         _CUSTOM_WORKFLOWS[wf["id"]]["last_run"] = started
         _CUSTOM_WORKFLOWS[wf["id"]]["run_count"] = _CUSTOM_WORKFLOWS[wf["id"]].get("run_count",0) + 1
 
-    # Slack notification on failure
-    slack = wf.get("slack_channel") or os.getenv("SLACK_WEBHOOK_URL","")
-    if failed and slack:
-        try:
-            msg = f"⚠️ *{wf.get('name','')}* — {len(failed)}/{len(check_results)} checks failed\n"
-            msg += "\n".join(f"• `{c['name']}`: {c['error'] or c['pass_condition']}" for c in failed[:5])
-            import httpx as _httpx
-            import asyncio as _asyncio
-            async def _notify():
-                async with _httpx.AsyncClient(timeout=5) as cl:
-                    await cl.post(slack, json={"text": msg})
-            _asyncio.create_task(_notify())
-        except Exception: pass
+    # Enhanced Slack notification — rich blocks + AI diagnosis
+    slack        = wf.get("slack_channel") or os.getenv("SLACK_WEBHOOK_URL","")
+    slack_bot    = os.getenv("SLACK_BOT_TOKEN","")
+    slack_ch_id  = os.getenv("SLACK_CHANNEL_ID","")
+
+    if failed:
+        async def _notify_slack():
+            try:
+                failed_names = [c["name"] for c in failed]
+                # Rule-based diagnosis — zero tokens
+                if any("ads" in n.lower() or "available" in n.lower() for n in failed_names):
+                    diagnosis = "Amazon Ads data has not arrived — downstream campaigns may be affected."
+                elif any("copy" in n.lower() or "gds" in n.lower() for n in failed_names):
+                    diagnosis = "GDS copy jobs are stuck — BI dashboards may show stale data."
+                elif any("fresh" in n.lower() or "date" in n.lower() for n in failed_names):
+                    diagnosis = "Data freshness issue — source pipeline may not have run."
+                else:
+                    diagnosis = f"{len(failed)} check(s) failed: {', '.join(failed_names[:3])}"
+
+                dashboard_url = os.getenv("WIZIAGENT_URL","https://your-dashboard.vercel.app")
+                wf_name = wf.get("name","")
+                blocks = [
+                    {"type":"header","text":{"type":"plain_text","text":f"🔴 {wf_name}"}},
+                    {"type":"section","fields":[
+                        {"type":"mrkdwn","text":f"*Status:*\n{len(failed)}/{len(check_results)} checks failed"},
+                        {"type":"mrkdwn","text":f"*Run time:*\n{started[:16].replace('T',' ')}"},
+                    ]},
+                    {"type":"section","text":{"type":"mrkdwn","text":f"*🤖 AI Diagnosis:*\n{diagnosis}"}},
+                    {"type":"section","text":{"type":"mrkdwn","text":"*Failed checks:*\n"+"\n".join(f"• {c['name']}" for c in failed[:5])}},
+                    {"type":"actions","elements":[
+                        {"type":"button","text":{"type":"plain_text","text":"🔍 View in Dashboard"},
+                         "url":f"{dashboard_url}#results/{run_id}","style":"danger"}
+                    ]},
+                    {"type":"divider"}
+                ]
+                async with httpx.AsyncClient(timeout=5) as cl:
+                    if slack_bot and slack_ch_id:
+                        await cl.post(
+                            "https://slack.com/api/chat.postMessage",
+                            headers={"Authorization":f"Bearer {slack_bot}","Content-Type":"application/json"},
+                            json={"channel":slack_ch_id,
+                                  "text":f"🔴 {wf_name} — {len(failed)} check(s) failed",
+                                  "blocks":blocks}
+                        )
+                    elif slack:
+                        msg = f"⚠️ *{wf_name}* — {len(failed)}/{len(check_results)} checks failed\n"
+                        msg += "\n".join(f"• `{c['name']}`: {c.get('error') or c.get('pass_condition','')}" for c in failed[:5])
+                        msg += f"\n\n🤖 {diagnosis}"
+                        await cl.post(slack, json={"text": msg})
+            except Exception:
+                pass
+        asyncio.create_task(_notify_slack())
 
     return run
 
