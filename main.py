@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 try:
     from rag_runbooks import router as runbook_router
     from slack_integration import router as slack_router
+    from datasources import router as ds_router, get_source_connection, execute_on_source, init_datasources
     _ADDONS_LOADED = True
 except ImportError:
     _ADDONS_LOADED = False
@@ -169,6 +170,16 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 if _ADDONS_LOADED:
     app.include_router(runbook_router)
     app.include_router(slack_router)
+    app.include_router(ds_router)
+
+# Init datasources cache on startup
+@app.on_event("startup")
+async def _startup():
+    if _ADDONS_LOADED:
+        try:
+            init_datasources()
+        except Exception as e:
+            print(f"[startup] datasources init error: {e}")
 
 _proactive_alerts: list = []   # visible to frontend via /api/anomaly/proactive
 
@@ -5603,73 +5614,86 @@ def custom_workflow_history_v2(wf_id: str = Query(None), limit: int = Query(100)
 
 async def _run_workflow_checks(wf: dict, triggered_by: str = "manual") -> dict:
     """
-    New check runner for v2 workflows — runs flat checks list.
-    Each check: {id, name, sql, pass_condition, severity}
-    pass_condition: "rows = 0" | "rows > 0" | "rows > N" | "value = N" | "value > N"
+    v2 check runner — each check can target its own data source via source_id.
+    Falls back to wf-level db_key, then "default" Redshift.
     """
-    run_id  = f"cwf_{uuid.uuid4().hex[:8]}"
-    started = datetime.datetime.utcnow().isoformat()
-    db_key  = wf.get("db_key", "default")
-    checks  = wf.get("checks", [])
+    run_id    = f"cwf_{uuid.uuid4().hex[:8]}"
+    started   = datetime.datetime.utcnow().isoformat()
+    wf_db_key = wf.get("db_key", "default")
+    checks    = wf.get("checks", [])
+
+    # Connection pool — reuse open connections per source within a run
+    _conns: dict = {}
+    def _get_conn(source_id: str):
+        if source_id not in _conns:
+            if _ADDONS_LOADED:
+                _conns[source_id] = get_source_connection(source_id)
+            else:
+                _conns[source_id] = get_connection(source_id if source_id != "default" else wf_db_key)
+        return _conns[source_id]
 
     check_results = []
-    try:
-        conn = get_connection(db_key)
-        for chk in checks:
-            sql   = (chk.get("sql") or "").strip()
-            cond  = (chk.get("pass_condition") or "rows = 0").strip()
-            name  = chk.get("name", "Check")
-            sev   = chk.get("severity", "high")
-            chk_id = chk.get("id", uuid.uuid4().hex[:8])
-            if not sql:
-                continue
-            t0 = datetime.datetime.utcnow()
-            try:
-                cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    for chk in checks:
+        sql       = (chk.get("sql") or "").strip()
+        cond      = (chk.get("pass_condition") or "rows = 0").strip()
+        name      = chk.get("name", "Check")
+        sev       = chk.get("severity", "high")
+        chk_id    = chk.get("id", uuid.uuid4().hex[:8])
+        source_id = chk.get("source_id") or wf_db_key or "default"
+        if not sql:
+            continue
+        t0 = datetime.datetime.utcnow()
+        try:
+            if _ADDONS_LOADED:
+                result    = execute_on_source(source_id, sql, limit=50)
+                if result["error"]:
+                    raise Exception(result["error"])
+                row_dicts = result["rows"]
+                cols      = result["columns"]
+            else:
+                conn      = _get_conn(source_id)
+                cur       = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
                 cur.execute(sql)
-                rows_out = cur.fetchmany(50)
-                cols     = [d[0] for d in cur.description] if cur.description else []
+                rows_out  = cur.fetchmany(50)
+                cols      = [d[0] for d in cur.description] if cur.description else []
                 cur.close()
                 row_dicts = [dict(r) for r in rows_out]
-                rc = len(row_dicts)
-                fv = list(row_dicts[0].values())[0] if row_dicts and row_dicts[0] else 0
 
-                # Evaluate pass condition
-                try:
-                    parts = cond.split()
-                    metric = parts[0]   # "rows" or "value"
-                    op     = parts[1]   # "=", ">", "<", ">=", "<="
-                    thresh = float(parts[2])
-                    actual = float(rc) if metric=="rows" else float(fv or 0)
-                    passed = eval(f"{actual} {op} {thresh}")
-                except Exception:
-                    passed = rc == 0  # safe default
+            rc = len(row_dicts)
+            fv = list(row_dicts[0].values())[0] if row_dicts and row_dicts[0] else 0
+            try:
+                parts  = cond.split()
+                metric = parts[0]
+                op     = parts[1]
+                thresh = float(parts[2])
+                actual = float(rc) if metric == "rows" else float(fv or 0)
+                passed = eval(f"{actual} {op} {thresh}")
+            except Exception:
+                passed = rc == 0
 
-                ms = int((datetime.datetime.utcnow()-t0).total_seconds()*1000)
-                check_results.append({
-                    "id": chk_id, "name": name, "sql": sql,
-                    "pass_condition": cond, "severity": sev,
-                    "passed": passed, "row_count": rc,
-                    "sample_rows": row_dicts[:5], "columns": cols,
-                    "duration_ms": ms,
-                    "error": None,
-                })
-            except Exception as ex:
-                ms = int((datetime.datetime.utcnow()-t0).total_seconds()*1000)
-                check_results.append({
-                    "id": chk_id, "name": name, "sql": sql,
-                    "pass_condition": cond, "severity": sev,
-                    "passed": False, "row_count": 0,
-                    "sample_rows": [], "columns": [],
-                    "duration_ms": ms,
-                    "error": str(ex)[:200],
-                })
-        conn.close()
-    except Exception as e:
-        check_results.append({
-            "id": "conn_error", "name": "Connection", "passed": False,
-            "error": str(e)[:200], "row_count": 0, "columns": [], "sample_rows": []
-        })
+            ms = int((datetime.datetime.utcnow() - t0).total_seconds() * 1000)
+            check_results.append({
+                "id": chk_id, "name": name, "sql": sql,
+                "pass_condition": cond, "severity": sev,
+                "passed": passed, "row_count": rc,
+                "sample_rows": row_dicts[:5], "columns": cols,
+                "duration_ms": ms, "source_id": source_id, "error": None,
+            })
+        except Exception as ex:
+            ms = int((datetime.datetime.utcnow() - t0).total_seconds() * 1000)
+            check_results.append({
+                "id": chk_id, "name": name, "sql": sql,
+                "pass_condition": cond, "severity": sev,
+                "passed": False, "row_count": 0,
+                "sample_rows": [], "columns": [],
+                "duration_ms": ms, "source_id": source_id,
+                "error": str(ex)[:200],
+            })
+
+    # Close pooled connections
+    for c in _conns.values():
+        try: c.close()
+        except Exception: pass
 
     failed = [c for c in check_results if not c["passed"]]
     status = "clean" if not failed else "issues_found"
@@ -5769,8 +5793,6 @@ async def run_workflow_v2(wf_id: str):
         wf = _CUSTOM_WORKFLOWS.get(wf_id)
     if not wf:
         return {"error": f"Workflow '{wf_id}' not found"}
-    if not wf.get("checks") and not wf.get("tables"):
-        return {"error": "Workflow has no checks configured"}
     if wf.get("checks"):
         return await _run_workflow_checks(wf, triggered_by="manual")
     else:

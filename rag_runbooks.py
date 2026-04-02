@@ -17,7 +17,7 @@ from pydantic import BaseModel
 RUNBOOKS_DIR = Path(__file__).parent / "runbooks"
 CHUNK_SIZE   = 400   # characters per chunk
 CHUNK_OVERLAP = 80
-EMBED_MODEL  = "all-MiniLM-L6-v2"   # fast, 80MB, runs on CPU
+EMBED_MODEL  = "fast-bge-small-en"   # ~40MB ONNX, no PyTorch
 TOP_K        = 4                      # chunks to retrieve
 
 router = APIRouter(prefix="/api/runbook", tags=["runbook"])
@@ -30,8 +30,8 @@ _embeds : Optional[np.ndarray] = None
 def _get_model():
     global _model
     if _model is None:
-        from sentence_transformers import SentenceTransformer
-        _model = SentenceTransformer(EMBED_MODEL)
+        from fastembed import TextEmbedding
+        _model = TextEmbedding(model_name=EMBED_MODEL)
     return _model
 
 def _chunk_markdown(text: str, source: str) -> List[dict]:
@@ -81,7 +81,7 @@ def _build_index():
 
     model  = _get_model()
     texts  = [c["text"] for c in _chunks]
-    _embeds = model.encode(texts, show_progress_bar=False, batch_size=32)
+    _embeds = np.array(list(model.embed(texts)))
     _embeds = _embeds / np.linalg.norm(_embeds, axis=1, keepdims=True)  # normalise
 
 def _retrieve(query: str, top_k: int = TOP_K) -> List[dict]:
@@ -92,7 +92,7 @@ def _retrieve(query: str, top_k: int = TOP_K) -> List[dict]:
         return []
 
     model   = _get_model()
-    q_emb   = model.encode([query], show_progress_bar=False)
+    q_emb   = np.array(list(model.embed([query])))
     q_emb   = q_emb / np.linalg.norm(q_emb, axis=1, keepdims=True)
     scores  = (_embeds @ q_emb.T).flatten()
     top_idx = np.argsort(scores)[::-1][:top_k]

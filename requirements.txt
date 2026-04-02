@@ -9,5 +9,6 @@ langchain-openai>=0.1.0
 langchain-core>=0.1.0
 langsmith>=0.1.0
 pytz
-sentence-transformers
+fastembed
+cryptography
 numpy
