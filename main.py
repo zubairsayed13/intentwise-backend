@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import psycopg2, psycopg2.extras, os, httpx, json, asyncio, threading, datetime, uuid
 from dotenv import load_dotenv
+from secrets_loader import load_secrets
 
 # ── RAG Runbooks + Slack AI integration ───────────────────────────────────────
 try:
@@ -13,7 +14,8 @@ try:
 except ImportError:
     _ADDONS_LOADED = False
 
-load_dotenv()
+load_secrets()   # AWS Secrets Manager → os.environ + DB_REGISTRY
+load_dotenv()    # local .env fallback (won't overwrite secrets)
 
 # ── Proactive anomaly baseline (stored in memory, refreshed daily) ────────────
 _anomaly_baseline: dict = {}   # {metric: {"mean": float, "std": float, "last_updated": str}}

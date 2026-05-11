@@ -1,5 +1,6 @@
 fastapi
 uvicorn
+gunicorn
 psycopg2-binary
 python-dotenv
 httpx
@@ -12,3 +13,10 @@ pytz
 fastembed
 cryptography
 numpy
+# AWS
+boto3
+# Multi-datasource drivers
+pymysql
+google-cloud-bigquery
+google-auth
+snowflake-connector-python
