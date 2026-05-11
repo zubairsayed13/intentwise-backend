@@ -117,7 +117,8 @@ def get_source_connection(key: str = "default") -> Any:
     return factory(cfg)
 
 
-def execute_on_source(key: str, sql: str, params=None) -> list:
+def execute_on_source(key: str, sql: str, params=None, **kwargs) -> list:
+    # kwargs absorbs unexpected arguments (e.g. limit=) from callers
     """
     Runs a query on the given datasource and returns rows as list of dicts.
     Works for Redshift, Postgres, MySQL, Snowflake.
